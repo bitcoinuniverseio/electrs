@@ -260,7 +260,7 @@ impl Query {
         // and credentials. It is a profile binding, not a source observation.
         let profile = super::read_context::StaticReadProfile {
             network: network.into(),
-            magic: self.config.magic,
+            magic: self.daemon.magic(),
             db_path: self.config.db_path.to_string_lossy().into_owned(),
             rpc_address: self.config.daemon_rpc_addr.to_string(),
             light_mode: self.config.light_mode,
