@@ -1,4 +1,4 @@
-name: Universe native prerequisites and isolated scope proof
+name: Universe exact failed scope diagnostic only
 
 on:
   workflow_dispatch:
@@ -12,6 +12,8 @@ on:
       - scripts/universe/sandbox-proof.py
       - scripts/universe/sandbox-proof-child.py
       - scripts/universe/sandbox-proof.test.py
+      - scripts/universe/sandbox-diagnostic.py
+      - scripts/universe/sandbox-diagnostic.test.py
 
 permissions:
   contents: read
@@ -32,17 +34,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Inspect existing tools and isolated build prerequisites only
+      - name: Read only previous exact failed run files or its scoped journal
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 scripts/universe/native-preflight.py
-      - name: Verify one bounded isolated user-unit scope without a build
-        shell: bash
-        env:
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          /usr/bin/python3 -B -I -S scripts/universe/sandbox-proof.py --run-proof
+          /usr/bin/python3 -B -I -S scripts/universe/sandbox-diagnostic.py --recover-only
