@@ -181,6 +181,15 @@ def main():
                        'errorType': type(error).__name__, 'error': str(error), 'originalLogsRetained': True,
                        'cleanupExitCode': cleanup.returncode if cleanup else None,
                        'cleanupError': cleanup_error, 'retry': False}, out)
+        try:
+            diagnostic_spec = importlib.util.spec_from_file_location('failure_diagnostic', HERE / 'sandbox-diagnostic.py')
+            diagnostic = importlib.util.module_from_spec(diagnostic_spec)
+            diagnostic_spec.loader.exec_module(diagnostic)
+            diagnostic.emit_failure(root, unit)
+        except BaseException as diagnostic_error:
+            print(json.dumps({'unit': unit, 'receiptPath': str(root / 'failure.json'),
+                              'boundedDiagnosticErrorType': type(diagnostic_error).__name__,
+                              'originalFailurePreserved': True}), flush=True)
         raise
 
 
