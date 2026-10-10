@@ -337,7 +337,7 @@ impl DiscoveryManager {
                 self.tor_proxy
                     .chain_err(|| "no tor proxy configured, onion hosts are unsupported")?,
             );
-            config = config.socks5(Some(socks)).unwrap()
+            config = config.socks5(Some(socks))
         }
 
         let client = Client::from_config(&server_url, config.build())?;

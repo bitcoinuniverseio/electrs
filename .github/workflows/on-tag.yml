@@ -20,6 +20,14 @@ jobs:
     runs-on: mempool-ci
     timeout-minutes: 120
     name: Build and push to DockerHub
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - image: electrs
+            cargo_extra_args: ""
+          - image: electrs-liquid
+            cargo_extra_args: "--features liquid"
     steps:
       - name: Set env variables
         run: echo "TAG=${GITHUB_REF/refs\/tags\//}" >> $GITHUB_ENV
@@ -35,21 +43,21 @@ jobs:
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Checkout project
-        uses: actions/checkout@v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         id: qemu
 
       - name: Setup Docker buildx action
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         id: buildx
 
       - name: Available platforms
         run: echo ${{ steps.buildx.outputs.platforms }}
 
       - name: Cache Docker layers
-        uses: actions/cache@v3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:
           path: /tmp/.buildx-cache
@@ -63,7 +71,8 @@ jobs:
           --cache-from "type=local,src=/tmp/.buildx-cache" \
           --cache-to "type=local,dest=/tmp/.buildx-cache" \
           --platform linux/amd64,linux/arm64 \
-          --tag ${{ secrets.DOCKER_HUB_USER }}/electrs:$TAG \
-          --tag ${{ secrets.DOCKER_HUB_USER }}/electrs:latest \
+          --tag ${{ secrets.DOCKER_HUB_USER }}/${{ matrix.image }}:$TAG \
+          --tag ${{ secrets.DOCKER_HUB_USER }}/${{ matrix.image }}:latest \
           --output "type=registry" . \
-          --build-arg commitHash=$SHORT_SHA
+          --build-arg commitHash=$SHORT_SHA \
+          --build-arg CARGO_EXTRA_ARGS="${{ matrix.cargo_extra_args }}"

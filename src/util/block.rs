@@ -1,3 +1,5 @@
+use bitcoin::hashes::Hash;
+
 use crate::chain::{BlockHash, BlockHeader};
 use crate::errors::*;
 use crate::new_index::BlockEntry;
@@ -73,7 +75,7 @@ impl HeaderList {
         HeaderList {
             headers: vec![],
             heights: HashMap::new(),
-            tip: BlockHash::default(),
+            tip: BlockHash::all_zeros(),
         }
     }
 
@@ -89,7 +91,7 @@ impl HeaderList {
 
         let mut blockhash = tip_hash;
         let mut headers_chain: Vec<BlockHeader> = vec![];
-        let null_hash = BlockHash::default();
+        let null_hash = BlockHash::all_zeros();
 
         while blockhash != null_hash {
             let header = headers_map.remove(&blockhash).unwrap_or_else(|| {
@@ -136,7 +138,7 @@ impl HeaderList {
             Some(h) => h.header.prev_blockhash,
             None => return vec![], // hashed_headers is empty
         };
-        let null_hash = BlockHash::default();
+        let null_hash = BlockHash::all_zeros();
         let new_height: usize = if prev_blockhash == null_hash {
             0
         } else {
@@ -175,7 +177,7 @@ impl HeaderList {
                 let expected_prev_blockhash = if height > 0 {
                     *self.headers[height - 1].hash()
                 } else {
-                    BlockHash::default()
+                    BlockHash::all_zeros()
                 };
                 assert_eq!(entry.header().prev_blockhash, expected_prev_blockhash);
                 height
@@ -230,7 +232,10 @@ impl HeaderList {
     pub fn tip(&self) -> &BlockHash {
         assert_eq!(
             self.tip,
-            self.headers.last().map(|h| *h.hash()).unwrap_or_default()
+            self.headers
+                .last()
+                .map(|h| *h.hash())
+                .unwrap_or(BlockHash::all_zeros())
         );
         &self.tip
     }
@@ -306,9 +311,13 @@ pub struct BlockHeaderMeta {
 
 impl From<&BlockEntry> for BlockMeta {
     fn from(b: &BlockEntry) -> BlockMeta {
+        #[cfg(not(feature = "liquid"))]
+        let weight = b.block.weight().to_wu() as u32;
+        #[cfg(feature = "liquid")]
+        let weight = b.block.weight() as u32;
         BlockMeta {
             tx_count: b.block.txdata.len() as u32,
-            weight: b.block.weight() as u32,
+            weight,
             size: b.size,
         }
     }

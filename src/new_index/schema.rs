@@ -2,7 +2,8 @@ use super::read_generation::ReadGeneration;
 use super::writer_update::{finish_qualified_plan, Phase, UpdatePlan, UpdateWriter};
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
-use bitcoin::util::merkleblock::MerkleBlock;
+use bitcoin::merkle_tree::MerkleBlock;
+#[cfg(not(feature = "liquid"))]
 use bitcoin::VarInt;
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 use bitcoin::consensus::encode::{deserialize, serialize};
 #[cfg(feature = "liquid")]
 use elements::{
-    encode::{deserialize, serialize},
+    encode::{deserialize, serialize, VarInt},
     AssetId,
 };
 
@@ -22,7 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::chain::{
-    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
+    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, TxidCompat, Value,
 };
 use crate::config::Config;
 use crate::daemon::Daemon;
@@ -832,7 +833,7 @@ impl Indexer {
                         runtime
                             .roster_seen
                             .reserve_hash(runtime.roster.len(), &mut window)?;
-                        let merkle = bitcoin::util::hash::bitcoin_merkle_root(
+                        let merkle = bitcoin::merkle_tree::calculate_root(
                             runtime.roster.iter().map(|txid| {
                                 bitcoin::TxMerkleNode::from_slice(&txid[..]).expect("fixed32")
                             }),
@@ -870,7 +871,7 @@ impl Indexer {
                         )?;
                         let tx: Transaction =
                             deserialize(&raw).map_err(|_| CoverageError::Contract)?;
-                        if tx.txid() != *txid || (position == 0) != tx.is_coin_base() {
+                        if tx.get_txid() != *txid || (position == 0) != tx.is_coinbase() {
                             return Err(CoverageError::Contract);
                         }
                         let header = runtime.header.as_ref().ok_or(CoverageError::Missing)?;
@@ -904,9 +905,9 @@ impl Indexer {
                                 runtime.progress.next_height,
                                 runtime.progress.transaction_position,
                                 TxHistoryInfo::Funding(FundingInfo {
-                                    txid: full_hash(&tx.txid()[..]),
+                                    txid: full_hash(&tx.get_txid()[..]),
                                     vout: index as u32,
-                                    value: output.value,
+                                    value: output.value.to_sat(),
                                 }),
                             )
                             .into_row();
@@ -956,7 +957,7 @@ impl Indexer {
                             )?;
                             let parent: Transaction =
                                 deserialize(&raw).map_err(|_| CoverageError::Contract)?;
-                            if parent.txid() != input.previous_output.txid {
+                            if parent.get_txid() != input.previous_output.txid {
                                 return Err(CoverageError::Contract);
                             }
                             let previous = parent
@@ -1016,13 +1017,13 @@ impl Indexer {
                                     window.reserve(1, 1 + raw.len() / 16)?;
                                     let position = super::qualified_edges::roster_position(
                                         &raw,
-                                        full_hash(&parent.txid()[..]),
+                                        full_hash(&parent.get_txid()[..]),
                                     )
                                     .map_err(|_| CoverageError::Contract)?;
                                     // Reserve roster scan and SHA tree work before either
                                     // operation; a point-read reservation alone is not
                                     // a reservation for hashing all parent transactions.
-                                    let merkle = bitcoin::util::hash::bitcoin_merkle_root(
+                                    let merkle = bitcoin::merkle_tree::calculate_root(
                                         raw[8..].chunks_exact(32).map(|bytes| {
                                             bitcoin::TxMerkleNode::from_slice(bytes)
                                                 .expect("fixed32")
@@ -1059,7 +1060,7 @@ impl Indexer {
                                 .parent_best_height
                                 .ok_or(CoverageError::Missing)?;
                             if parent_height == 0
-                                || (parent.is_coin_base()
+                                || (parent.is_coinbase()
                                     && runtime.progress.next_height
                                         < parent_height.saturating_add(100))
                             {
@@ -1070,11 +1071,11 @@ impl Indexer {
                                 runtime.progress.next_height,
                                 runtime.progress.transaction_position,
                                 TxHistoryInfo::Spending(SpendingInfo {
-                                    txid: full_hash(&tx.txid()[..]),
+                                    txid: full_hash(&tx.get_txid()[..]),
                                     vin: index as u32,
                                     prev_txid: full_hash(&input.previous_output.txid[..]),
                                     prev_vout: input.previous_output.vout,
-                                    value: previous.value,
+                                    value: previous.value.to_sat(),
                                 }),
                             )
                             .into_row();
@@ -1101,7 +1102,7 @@ impl Indexer {
                                         .hash()[..],
                                 ),
                                 spending_position: runtime.progress.transaction_position,
-                                spending_txid: full_hash(&tx.txid()[..]),
+                                spending_txid: full_hash(&tx.get_txid()[..]),
                                 spending_vin: index as u32,
                             }
                             .encode();
@@ -1883,14 +1884,14 @@ impl PagedChainSnapshot<'_> {
                     .point_value(&TxRow::key(&value.txid), 4 * 1024 * 1024)?
                     .ok_or(PageError::Unavailable)?;
                 let tx: Transaction = deserialize(&raw).map_err(|_| PageError::Contract)?;
-                if full_hash(&tx.txid()[..]) != value.txid {
+                if full_hash(&tx.get_txid()[..]) != value.txid {
                     return Err(PageError::Contract);
                 }
                 let output = tx
                     .output
                     .get(value.vout as usize)
                     .ok_or(PageError::Contract)?;
-                if output.value != value.value
+                if output.value.to_sat() != value.value
                     || compute_script_hash(&output.script_pubkey) != self.script_hash
                 {
                     return Err(PageError::Contract);
@@ -1919,7 +1920,7 @@ impl PagedChainSnapshot<'_> {
                                     && is_spendable(output) =>
                             {
                                 Some(Funding {
-                                    txid: tx.txid(),
+                                    txid: tx.get_txid(),
                                     vout: value.vout,
                                     value: value.value,
                                     height: decoded.confirmed_height,
@@ -2017,7 +2018,7 @@ impl PagedChainSnapshot<'_> {
                 .point_value(&TxRow::key(&edge.spending_txid), 4 * 1024 * 1024)?
                 .ok_or(PageError::Unavailable)?;
             let tx: Transaction = deserialize(&raw).map_err(|_| PageError::Contract)?;
-            if tx.txid() != txid
+            if tx.get_txid() != txid
                 || tx
                     .input
                     .get(edge.spending_vin as usize)
@@ -2981,7 +2982,7 @@ impl ChainQuery {
             .ok_or(ErrorKind::LegacyPositionUnavailable)?;
         let tx: Transaction =
             deserialize(&raw).map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
-        if tx.txid() != history.get_txid() {
+        if tx.get_txid() != history.get_txid() {
             bail!(ErrorKind::LegacyPositionUnavailable);
         }
         let (output, value) = match &history.key.txinfo {
@@ -3008,7 +3009,7 @@ impl ChainQuery {
                     .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                 let parent: Transaction = deserialize(&raw)
                     .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
-                if full_hash(&parent.txid()[..]) != info.prev_txid {
+                if full_hash(&parent.get_txid()[..]) != info.prev_txid {
                     bail!(ErrorKind::LegacyPositionUnavailable);
                 }
                 (
@@ -3021,7 +3022,9 @@ impl ChainQuery {
                 )
             }
         };
-        if output.value != value || compute_script_hash(&output.script_pubkey) != history.key.hash {
+        if output.value.to_sat() != value
+            || compute_script_hash(&output.script_pubkey) != history.key.hash
+        {
             bail!(ErrorKind::LegacyPositionUnavailable);
         }
         Ok(())
@@ -3221,7 +3224,7 @@ impl ChainQuery {
         let _timer = self.start_timer("lookup_txn");
         self.lookup_raw_txn(txid, blockhash).map(|rawtx| {
             let txn: Transaction = deserialize(&rawtx).expect("failed to parse Transaction");
-            assert_eq!(*txid, txn.txid());
+            assert_eq!(*txid, txn.get_txid());
             txn
         })
     }
@@ -3302,7 +3305,7 @@ impl ChainQuery {
                 .ok_or(ErrorKind::LegacyPositionUnavailable)?;
             let transaction: Transaction =
                 deserialize(&raw).map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
-            if transaction.txid() != outpoint.txid {
+            if transaction.get_txid() != outpoint.txid {
                 bail!(ErrorKind::LegacyPositionUnavailable);
             }
             let output = transaction
@@ -3358,7 +3361,7 @@ impl ChainQuery {
                         .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                     let spending: Transaction = deserialize(&raw)
                         .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
-                    if spending.txid() != txid
+                    if spending.get_txid() != txid
                         || spending
                             .input
                             .get(edge.spending_vin as usize)
@@ -3455,7 +3458,7 @@ impl ChainQuery {
             .header_by_hash(&block.hash)
             .ok_or(ErrorKind::LegacyPositionUnavailable)?;
         let merkle =
-            bitcoin::util::hash::bitcoin_merkle_root(raw[8..].chunks_exact(32).map(|hash| {
+            bitcoin::merkle_tree::calculate_root(raw[8..].chunks_exact(32).map(|hash| {
                 bitcoin::TxMerkleNode::from_slice(hash).expect("checked fixed32 hash")
             }))
             .ok_or(ErrorKind::LegacyPositionUnavailable)?;
@@ -3582,7 +3585,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .map(|b| {
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
-            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.txid()).collect();
+            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.get_txid()).collect();
             for tx in &b.block.txdata {
                 add_transaction(tx, blockhash, &mut rows, iconfig);
             }
@@ -3612,7 +3615,7 @@ fn add_transaction(
         rows.push(TxRow::new(tx).into_row());
     }
 
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&tx.get_txid()[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) {
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
@@ -3638,24 +3641,7 @@ fn lookup_txos(
     outpoints: &BTreeSet<OutPoint>,
     allow_missing: bool,
 ) -> HashMap<OutPoint, TxOut> {
-    let mut loop_count = 10;
-    let pool = loop {
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(16) // we need to saturate SSD IOPS
-            .thread_name(|i| format!("lookup-txo-{}", i))
-            .build()
-        {
-            Ok(pool) => break pool,
-            Err(e) => {
-                if loop_count == 0 {
-                    panic!("schema::lookup_txos failed to create a ThreadPool: {}", e);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                loop_count -= 1;
-            }
-        }
-    };
-    pool.install(|| {
+    super::THREAD_POOL.install(|| {
         // Should match lookup_txos_sequential
         outpoints
             .par_iter()
@@ -3755,9 +3741,13 @@ fn index_transaction(
     //      H{funding-scripthash}{funding-height}{funding-block-pos}F{funding-txid:vout} → ""
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&tx.get_txid()[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) || iconfig.index_unspendables {
+            #[cfg(not(feature = "liquid"))]
+            let value = txo.value.to_sat();
+            #[cfg(feature = "liquid")]
+            let value = txo.value;
             let history = TxHistoryRow::new(
                 &txo.script_pubkey,
                 confirmed_height,
@@ -3765,7 +3755,7 @@ fn index_transaction(
                 TxHistoryInfo::Funding(FundingInfo {
                     txid,
                     vout: txo_index as u32,
-                    value: txo.value,
+                    value,
                 }),
             );
             rows.push(history.into_row());
@@ -3785,6 +3775,11 @@ fn index_transaction(
             .get(&txi.previous_output)
             .unwrap_or_else(|| panic!("missing previous txo {}", txi.previous_output));
 
+        #[cfg(not(feature = "liquid"))]
+        let prev_value = prev_txo.value.to_sat();
+        #[cfg(feature = "liquid")]
+        let prev_value = prev_txo.value;
+
         let history = TxHistoryRow::new(
             &prev_txo.script_pubkey,
             confirmed_height,
@@ -3794,7 +3789,7 @@ fn index_transaction(
                 vin: txi_index as u32,
                 prev_txid: full_hash(&txi.previous_output.txid[..]),
                 prev_vout: txi.previous_output.vout,
-                value: prev_txo.value,
+                value: prev_value,
             }),
         );
         rows.push(history.into_row());
@@ -3876,7 +3871,7 @@ struct TxRow {
 
 impl TxRow {
     fn new(txn: &Transaction) -> TxRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.get_txid()[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),
@@ -3909,7 +3904,7 @@ struct TxConfRow {
 
 impl TxConfRow {
     fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.get_txid()[..]);
         TxConfRow {
             key: TxConfKey {
                 code: b'C',
@@ -4598,18 +4593,18 @@ mod supplemental_edge_writer_tests {
             vout: 0,
         };
         let previous = TxOut {
-            value: 5,
+            value: bitcoin::Amount::from_sat(5),
             script_pubkey: Script::new(),
         };
         let tx = Transaction {
-            version: 2,
-            lock_time: 0,
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
                 previous_output: point,
                 ..Default::default()
             }],
             output: vec![TxOut {
-                value: 4,
+                value: bitcoin::Amount::from_sat(4),
                 script_pubkey: Script::new(),
             }],
         };
@@ -4649,8 +4644,20 @@ mod supplemental_edge_writer_tests {
         };
         let ancestor_edge = edge(&ancestor);
         let orphan_edge = edge(&orphan);
+        let amounts = ancestor
+            .iter()
+            .filter(|row| row.key.first() == Some(&b'H'))
+            .map(|row| {
+                let history: TxHistoryKey = bincode_util::deserialize_big(&row.key).unwrap();
+                match history.txinfo {
+                    TxHistoryInfo::Funding(info) => (false, info.value),
+                    TxHistoryInfo::Spending(info) => (true, info.value),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(amounts, vec![(false, 4), (true, 5)]);
         assert_eq!(ancestor_edge.funding_txid, full_hash(&point.txid[..]));
-        assert_eq!(ancestor_edge.spending_txid, full_hash(&tx.txid()[..]));
+        assert_eq!(ancestor_edge.spending_txid, full_hash(&tx.get_txid()[..]));
         assert_eq!(ancestor_edge.spending_block_hash, [7; 32]);
         assert_eq!(orphan_edge.spending_block_hash, [8; 32]);
         assert_eq!(ancestor_edge.spending_position, 2);

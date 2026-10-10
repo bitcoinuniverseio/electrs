@@ -5,6 +5,7 @@ DAEMON=bitcoin
 NETWORK=mainnet
 FEATURES=default
 DB_FOLDER=/electrs
+ASSET_DB_ARGS=()
 NODENAME=$(hostname|cut -d . -f1)
 LOCATION=$(hostname|cut -d . -f2)
 USAGE="Usage: $0 (mainnet|testnet|signet|liquid|liquidtestnet) [popular-scripts]"
@@ -42,7 +43,7 @@ esac
 # which network?
 case "${1}" in
 	mainnet)
-		THREADS=$((NPROC / 4))
+		THREADS=$((NPROC / 8))
 		CRONJOB_TIMING="20 4 * * *"
 	;;
 	testnet)
@@ -64,6 +65,7 @@ case "${1}" in
 		DAEMON=elements
 		NETWORK=liquid
 		FEATURES=liquid
+		ASSET_DB_ARGS=(--asset-db-path /elements/asset_registry_db)
 		THREADS=$((NPROC / 8))
 		CRONJOB_TIMING="12 4 * * *"
 	;;
@@ -71,6 +73,7 @@ case "${1}" in
 		DAEMON=elements
 		NETWORK=liquidtestnet
 		FEATURES=liquid
+		ASSET_DB_ARGS=(--asset-db-path /elements/asset_registry_testnet_db)
 		THREADS=$((NPROC / 8))
 		CRONJOB_TIMING="17 4 * * *"
 	;;
@@ -89,6 +92,9 @@ POPULAR_SCRIPTS_FILE="${POPULAR_SCRIPTS_FOLDER}/popular-scripts.txt"
 generate_popular_scripts() {
 	mkdir -p "${POPULAR_SCRIPTS_FOLDER}"
 
+	## Use fewer threads for popular-scripts to keep system load low
+	local JOB_THREAD_COUNT=$(( (THREADS / 4) + 1 ))
+
 	## Use nproc * 4 threads to generate the txt file (lots of iowait, so 2x~4x core count is ok)
 	## Only pick up addresses with 101 history events or more
 	## (Without lowering MIN_HISTORY_ITEMS_TO_CACHE this is the lowest we can go)
@@ -96,8 +102,8 @@ generate_popular_scripts() {
 	echo "[*] Generating popular-scripts using ${THREADS} threads..."
 	cd "${HOME}/electrs"
 	HIGH_USAGE_THRESHOLD=101 \
-	JOB_THREAD_COUNT=${THREADS} \
-	nice cargo run \
+	JOB_THREAD_COUNT=${JOB_THREAD_COUNT} \
+	nice -n 19 cargo run \
 		--release \
 		--bin popular-scripts \
 		--features "${FEATURES}" \
@@ -153,6 +159,9 @@ do
 	# prepare run-time variables
 	UTXOS_LIMIT=500
 	ELECTRUM_TXS_LIMIT=500
+	ELECTRUM_MAX_LINE_SIZE=1048576 # 1 MiB
+	ELECTRUM_MAX_SUBSCRIPTIONS=100
+	ELECTRUM_MAX_CLIENTS=1000
 	MAIN_LOOP_DELAY=500
 	DAEMON_CONF="${HOME}/${DAEMON}.conf"
 	HTTP_SOCKET_FILE="${HOME}/socket/esplora-${DAEMON}-${NETWORK}"
@@ -164,46 +173,69 @@ do
 	RPC_PASS=$(grep 'rpcpassword=' "${DAEMON_CONF}"|cut -d = -f2|head -1)
 
 	# override limits based on hostname
-	if [ "${NODENAME}" = "node201" ];then
+	if [ "${NODENAME}" = "node201" ] || [ "${NODENAME}" = "node214" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 		MAIN_LOOP_DELAY=14000
 	fi
 	if [ "${NODENAME}" = "node204" ] && [ "${LOCATION}" = "sg1" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NODENAME}" = "node204" ] && [ "${LOCATION}" = "hnl" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NODENAME}" = "node206" ] && [ "${LOCATION}" = "tk7" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NODENAME}" = "node211" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NODENAME}" = "node212" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NODENAME}" = "node213" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
-	fi
-	if [ "${NODENAME}" = "node214" ];then
-		UTXOS_LIMIT=9000
-		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${NETWORK}" = "testnet4" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 	if [ "${LOCATION}" = "fmt" ];then
 		UTXOS_LIMIT=9000
 		ELECTRUM_TXS_LIMIT=9000
+		ELECTRUM_MAX_LINE_SIZE=16777216 # 16 MiB
+		ELECTRUM_MAX_SUBSCRIPTIONS=100000
+		ELECTRUM_MAX_CLIENTS=10000
 	fi
 
 	if [ ! -e "${POPULAR_SCRIPTS_FILE}" ];then
@@ -211,7 +243,7 @@ do
 	fi
 
 	# Run the electrs process (Note: db-dir is used in both commands)
-	cargo run \
+	nice -n 7 cargo run \
 		--release \
 		--bin electrs \
 		--features "${FEATURES}" \
@@ -219,6 +251,7 @@ do
 		--network "${NETWORK}" \
 		--daemon-dir "${HOME}" \
 		--db-dir "${DB_FOLDER}" \
+		"${ASSET_DB_ARGS[@]}" \
 		--main-loop-delay "${MAIN_LOOP_DELAY}" \
 		--rpc-socket-file "${RPC_SOCKET_FILE}" \
 		--http-socket-file "${HTTP_SOCKET_FILE}" \
@@ -229,6 +262,9 @@ do
 		--address-search \
 		--utxos-limit "${UTXOS_LIMIT}" \
 		--electrum-txs-limit "${ELECTRUM_TXS_LIMIT}" \
+		--electrum-max-line-size "${ELECTRUM_MAX_LINE_SIZE}" \
+		--electrum-max-subscriptions "${ELECTRUM_MAX_SUBSCRIPTIONS}" \
+		--electrum-max-clients "${ELECTRUM_MAX_CLIENTS}" \
 		-vv
 	sleep 1
 done

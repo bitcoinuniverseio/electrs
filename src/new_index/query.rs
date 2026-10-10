@@ -6,7 +6,7 @@ use std::convert::TryFrom;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid, TxidCompat};
 use crate::config::Config;
 use crate::daemon::{Daemon, MempoolAcceptResult, SubmitPackageResult};
 use crate::errors::*;
@@ -16,7 +16,7 @@ use crate::util::{is_spendable, BlockId, Bytes, TransactionStatus};
 #[cfg(feature = "liquid")]
 use crate::{
     chain::{asset::AssetRegistryLock, AssetId},
-    elements::{lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
+    elements::{lookup_asset, AssetMeta, AssetRegistry, AssetSorting, LiquidAsset},
 };
 
 const FEE_ESTIMATES_TTL: u64 = 60; // seconds
@@ -415,7 +415,7 @@ impl Query {
     }
 
     pub fn lookup_tx_spends(&self, tx: Transaction) -> Result<Vec<Option<SpendingInput>>> {
-        let txid = tx.txid();
+        let txid = tx.get_txid();
         #[cfg(not(feature = "liquid"))]
         let budget = super::qualified_edges::ReadBudget::new();
 
@@ -539,6 +539,15 @@ impl Query {
     }
 
     #[cfg(feature = "liquid")]
+    pub fn lookup_registry_asset(&self, asset_id: &AssetId) -> Result<Option<AssetMeta>> {
+        let asset_db = self
+            .asset_db
+            .as_ref()
+            .chain_err(|| "asset registry unavailable")?;
+        Ok(asset_db.read().unwrap().get(asset_id).cloned())
+    }
+
+    #[cfg(feature = "liquid")]
     pub fn list_registry_assets(
         &self,
         start_index: usize,
@@ -564,5 +573,28 @@ impl Query {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((total_num, results))
+    }
+
+    #[cfg(feature = "liquid")]
+    pub fn search_registry_assets<T, F>(
+        &self,
+        search: &str,
+        limit: usize,
+        mut map: F,
+    ) -> Result<Vec<T>>
+    where
+        F: FnMut(&AssetId, &AssetMeta) -> T,
+    {
+        let asset_db = self
+            .asset_db
+            .as_ref()
+            .chain_err(|| "asset registry unavailable")?;
+        Ok(asset_db
+            .read()
+            .unwrap()
+            .search(search, limit)
+            .into_iter()
+            .map(|(asset_id, metadata)| map(asset_id, metadata))
+            .collect())
     }
 }
