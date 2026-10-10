@@ -1,4 +1,4 @@
-name: Universe isolated helper ABI metadata only
+name: Universe private draft ONE small FUSE proof
 
 on:
   workflow_dispatch:
@@ -28,6 +28,10 @@ on:
       - scripts/universe/helper-runtime-metadata.py
       - scripts/universe/helper-runtime-metadata.test.py
       - scripts/universe/inspect-fuse-packages.py
+      - scripts/universe/draft-helper-proof-driver.py
+      - scripts/universe/draft-helper-proof-driver.test.py
+      - scripts/universe/receive-helper-transfer.py
+      - scripts/universe/small-fuse-image-proof.py
 
 permissions:
   contents: read
@@ -48,10 +52,11 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Observe exact existing host library ABI without helper execution
+      - name: Verify private draft assets and run ONE bounded small image proof
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          /usr/bin/python3.12 -B -I -S scripts/universe/helper-runtime-metadata.py --observe-owned-runtime
+          /usr/bin/python3.12 -B -I -S scripts/universe/draft-helper-proof-driver.py --run-one-small-proof
