@@ -1,0 +1,183 @@
+"""Read-only Linux build prerequisite metadata, never an installer or build."""
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import re
+import shutil
+import subprocess
+import sys
+
+DRAFT = '42ef9c89e2a4cab2865fdbe8c8bcb37e74256715'
+LOCK_SHA = 'd70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676'
+SOURCE = pathlib.Path(__file__).resolve().parents[2]
+
+
+def read_small(path, maximum=65536):
+    with pathlib.Path(path).open('rb') as stream:
+        raw = stream.read(maximum + 1)
+    if len(raw) > maximum:
+        raise ValueError('metadata size bound')
+    return raw.decode('utf8').strip()
+
+
+def run_metadata(argv, cwd=SOURCE, version_tool=None):
+    if not argv or not pathlib.Path(argv[0]).is_absolute():
+        raise ValueError('absolute existing metadata executable required')
+    name = pathlib.Path(argv[0]).name
+    tail = argv[1:]
+    allowed = name == 'git' and (tail in [['rev-parse', 'HEAD'], ['status', '--porcelain']]
+                                or len(tail) == 4 and tail[:3] == ['merge-base', '--is-ancestor', DRAFT])
+    allowed = allowed or name == 'rustc' and tail in [['-Vv'], ['--print', 'target-list']]
+    version_path = shutil.which(version_tool) if version_tool in ['cc', 'c++', 'clang', 'cmake'] else None
+    allowed = allowed or (version_path is not None and tail == ['--version']
+                          and pathlib.Path(version_path).resolve() == pathlib.Path(argv[0]))
+    if not allowed:
+        raise ValueError('preflight metadata command only; cargo/install/build forbidden')
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=5, check=True)
+    if len(result.stdout) > 65536 or len(result.stderr) > 8192:
+        raise ValueError('metadata command output bound')
+    return result.stdout.decode('utf8').strip()
+
+
+def file_pin(path, source=SOURCE):
+    source = pathlib.Path(source).resolve(strict=True)
+    path = pathlib.Path(path).resolve(strict=True)
+    if path == source or source in path.parents or not path.is_file():
+        raise ValueError('tool must be an existing file outside checkout')
+    size = path.stat().st_size
+    if size > 256 * 1024 * 1024:
+        raise ValueError('tool size bound')
+    sha = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            sha.update(block)
+    return {'path': str(path), 'bytes': size, 'sha256': sha.hexdigest()}
+
+
+def require_rust_version(value):
+    lines = value.splitlines()
+    if not lines or not re.fullmatch(r'rustc 1\.89\.0 \([0-9a-f]+ [0-9-]+\)', lines[0]):
+        raise ValueError('exact existing Rust1.89.0 required; no fallback')
+    if 'host: x86_64-unknown-linux-gnu' not in lines:
+        raise ValueError('existing Linux x86_64 GNU toolchain required')
+
+
+def cgroup_location(value):
+    rows = [line[3:] for line in value.splitlines() if line.startswith('0::')]
+    if len(rows) != 1 or not rows[0].startswith('/') or '..' in pathlib.PurePosixPath(rows[0]).parts:
+        raise ValueError('invalid own unified cgroup path')
+    return pathlib.Path('/sys/fs/cgroup') / rows[0].lstrip('/')
+
+
+def collect():
+    if platform.system() != 'Linux' or platform.machine() != 'x86_64':
+        raise ValueError('owned Linux x86_64 runner required')
+    if os.environ.get('GITHUB_REPOSITORY') != 'bitcoinuniverseio/electrs':
+        raise ValueError('owned fork only')
+    if os.environ.get('GITHUB_REF') != 'refs/heads/codex/bounded-script-utxo-pages':
+        raise ValueError('reviewed draft branch only')
+    expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
+    if not re.fullmatch('[0-9a-f]{40}', expected):
+        raise ValueError('full dispatched source SHA required')
+    git = shutil.which('git')
+    if not git:
+        raise ValueError('existing Git absent')
+    git_pin = file_pin(git)
+    git = git_pin['path']
+    head = run_metadata([git, 'rev-parse', 'HEAD'])
+    if head != expected or run_metadata([git, 'status', '--porcelain']):
+        raise ValueError('source revision/drift')
+    run_metadata([git, 'merge-base', '--is-ancestor', DRAFT, head])
+    lock = (SOURCE / 'Cargo.lock').read_bytes()
+    if hashlib.sha256(lock).hexdigest() != LOCK_SHA:
+        raise ValueError('original lock drift')
+    report = {'schema': 'universe-electrs-linux-preflight-v1',
+              'observedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'sourceSha': head, 'draftAncestor': DRAFT, 'lockSha256': LOCK_SHA,
+              'tools': {'git': git_pin}, 'missing': [], 'nativeActions': False, 'cargoInvoked': False,
+              'compiled': False, 'dependencyFetch': False, 'installed': False,
+              'fullAdapterQualification': False}
+    home = pathlib.Path.home()
+    # Exactly this version/target, never rustup shims, PATH Rust or another version.
+    rust_bin = home / '.rustup/toolchains/1.89.0-x86_64-unknown-linux-gnu/bin'
+    for name in ['rustc', 'cargo']:
+        path = rust_bin / name
+        if not path.is_file():
+            report['missing'].append('existing-' + name + '-1.89.0')
+            continue
+        if path.is_symlink():
+            raise ValueError('Rust executable must be direct, never rustup/proxy')
+        pin = file_pin(path)
+        if pathlib.Path(pin['path']).name != name:
+            raise ValueError('Rust executable proxy rejected')
+        if name == 'rustc':
+            version = run_metadata([pin['path'], '-Vv'])
+            require_rust_version(version)
+            pin['version'] = version
+            target = run_metadata([pin['path'], '--print', 'target-list'])
+            pin['linuxTargetSupported'] = 'x86_64-unknown-linux-gnu' in target.splitlines()
+            lib = rust_bin.parent / 'lib/rustlib/x86_64-unknown-linux-gnu/lib'
+            pin['targetStdlibPresent'] = lib.is_dir() and any(lib.glob('libstd-*.rlib'))
+            if not pin['linuxTargetSupported']:
+                report['missing'].append('existing-rustc-linux-target-support')
+            if not pin['targetStdlibPresent']:
+                report['missing'].append('existing-rust-linux-target-stdlib')
+        else:
+            pin['versionNotInvoked'] = True
+            pin['versionDirectoryOnlyNotCompilerQualification'] = '1.89.0'
+        report['tools'][name] = pin
+    for name in ['cc', 'c++', 'clang', 'cmake', 'unshare', 'systemd-run']:
+        path = shutil.which(name)
+        if not path:
+            report['missing'].append('existing-' + name)
+            continue
+        report['tools'][name] = file_pin(path)
+        if name in ['cc', 'c++', 'clang', 'cmake']:
+            report['tools'][name]['version'] = run_metadata([report['tools'][name]['path'], '--version'], version_tool=name)[:8192]
+    prefix = pathlib.Path(os.environ.get('UNIVERSE_HOST_TOOLS_ROOT', str(home / '.local/universe-host-tools'))) / 'prefix'
+    report['hostToolsPrefixPresent'] = prefix.is_dir()
+    report['sharedInstallerInvoked'] = False
+    # Bounded known libclang locations only, no recursive host inventory.
+    libraries = [prefix / 'usr/lib/x86_64-linux-gnu/libclang.so.1',
+                 prefix / 'lib/libclang.so', pathlib.Path('/usr/lib/llvm-18/lib/libclang.so.1')]
+    report['libclang'] = [file_pin(path) for path in libraries if path.is_file()]
+    if not report['libclang']:
+        report['missing'].append('existing-libclang-known-paths')
+    mem = read_small('/proc/meminfo')
+    allowed = ['MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree']
+    report['memoryKiB'] = {key: int(re.search(r'^' + key + r':\s+(\d+) kB$', mem, re.M).group(1)) for key in allowed}
+    temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+    if temp == SOURCE or SOURCE in temp.parents or temp == pathlib.Path('/'):
+        raise ValueError('runner temp scope invalid')
+    report['freeTempBytes'] = shutil.disk_usage(temp).free
+    report['pressure'] = {name: read_small('/proc/pressure/' + name, 4096) for name in ['cpu', 'io', 'memory']}
+    group = cgroup_location(read_small('/proc/self/cgroup', 4096))
+    report['ownCgroup'] = {name: read_small(group / name, 4096) for name in
+                          ['cgroup.controllers', 'cgroup.type', 'cpu.max', 'memory.max', 'pids.max'] if (group / name).is_file()}
+    report['ownCgroupWritableMetadata'] = os.access(group / 'cgroup.procs', os.W_OK)
+    user_limit = pathlib.Path('/proc/sys/user/max_user_namespaces')
+    report['maxUserNamespaces'] = int(read_small(user_limit, 64)) if user_limit.is_file() else None
+    report['sandboxCreationProven'] = False
+    report['durableHeadroomProven'] = False
+    report['nextGates'] = ['Reviewed tool hashes/version and full locked Linux source build',
+                           'Controlled owned resource/network sandbox creation proof',
+                           'Existing-store/reorg completeness and actual Hyper/RocksDB tests']
+    report['metadataToolsPresent'] = not report['missing']
+    return report
+
+
+def main():
+    report = collect()
+    raw = json.dumps(report, sort_keys=True)
+    if len(raw.encode()) > 262144:
+        raise ValueError('receipt bound')
+    print(raw)
+    # Partial metadata survives stdout; absent requirements never trigger installs.
+    return 0 if report['metadataToolsPresent'] else 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
