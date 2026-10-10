@@ -314,10 +314,10 @@ impl Indexer {
         let (tx, rx) = crossbeam_channel::unbounded();
         // Delete history_db
         bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
-            .map(|blocks| self.index(&blocks, Operation::DeleteBlocksWithHistory(tx.clone())));
+            .map(|blocks| self.index(&blocks, Operation::DeleteBlocksWithHistory(tx.clone())))?;
         // Delete txstore
         bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
-            .map(|blocks| self.add(&blocks, Operation::DeleteBlocks));
+            .map(|blocks| self.add(&blocks, Operation::DeleteBlocks))?;
         // All senders must be dropped for receiver iterator to finish
         drop(tx);
 
@@ -331,7 +331,7 @@ impl Indexer {
                 UtxoCacheRow::key(&script),
                 #[cfg(feature = "liquid")]
                 [b"z", &script[..]].concat(), // asset cache key
-            ]);
+            ])?;
         }
         Ok(())
     }
@@ -509,7 +509,7 @@ impl Indexer {
         result
     }
 
-    fn add(&self, blocks: &[BlockEntry], op: Operation) {
+    fn add(&self, blocks: &[BlockEntry], op: Operation) -> Result<()> {
         debug!("{} {} blocks to Indexer", op, blocks.len());
         let write_label = match &op {
             Operation::AddBlocks => "add_write",
@@ -528,7 +528,7 @@ impl Indexer {
             } else {
                 self.store
                     .txstore_db
-                    .delete(rows.into_iter().map(|r| r.key).collect());
+                    .delete(rows.into_iter().map(|r| r.key).collect())?;
             }
         }
 
@@ -549,9 +549,10 @@ impl Indexer {
                 added_blockhashes.remove(b.entry.hash());
             }
         }
+        Ok(())
     }
 
-    fn index(&self, blocks: &[BlockEntry], op: Operation) {
+    fn index(&self, blocks: &[BlockEntry], op: Operation) -> Result<()> {
         debug!("Indexing ({}) {} blocks with Indexer", op, blocks.len());
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
@@ -583,7 +584,7 @@ impl Indexer {
         } else {
             self.store
                 .history_db
-                .delete(rows.into_iter().map(|r| r.key).collect());
+                .delete(rows.into_iter().map(|r| r.key).collect())?;
         }
         // Keep the existing marker filter consistent with the completed DB
         // batch, including a removed fork that later becomes current again.
@@ -595,6 +596,7 @@ impl Indexer {
                 indexed.remove(block.entry.hash());
             }
         }
+        Ok(())
     }
 }
 
@@ -615,7 +617,7 @@ impl UpdateWriter<HeaderEntry, BlockHash> for IndexerReadWriter<'_> {
                     .store
                     .txstore_db
                     .put_sync(b"t", &serialize(&tip)),
-                None => self.indexer.store.txstore_db.delete(vec![b"t".into()]),
+                None => self.indexer.store.txstore_db.delete(vec![b"t".into()])?,
             }
         }
         Ok(())
@@ -629,7 +631,7 @@ impl UpdateWriter<HeaderEntry, BlockHash> for IndexerReadWriter<'_> {
     fn add(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
         let headers = self.indexer.headers_to_add(&plan.headers);
         start_fetcher(self.indexer.from, self.daemon, headers)?
-            .map(|blocks| self.indexer.add(&blocks, Operation::AddBlocks));
+            .map(|blocks| self.indexer.add(&blocks, Operation::AddBlocks))?;
         self.indexer
             .start_auto_compactions(&self.indexer.store.txstore_db);
         Ok(())
@@ -637,7 +639,7 @@ impl UpdateWriter<HeaderEntry, BlockHash> for IndexerReadWriter<'_> {
     fn index(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
         let headers = self.indexer.headers_to_index(&plan.headers);
         start_fetcher(self.indexer.from, self.daemon, headers)?
-            .map(|blocks| self.indexer.index(&blocks, Operation::AddBlocks));
+            .map(|blocks| self.indexer.index(&blocks, Operation::AddBlocks))?;
         self.indexer
             .start_auto_compactions(&self.indexer.store.history_db);
         Ok(())

@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 
 use crate::chain::{Block, BlockHash};
@@ -42,24 +46,27 @@ pub struct BlockEntry {
 
 type SizedBlock = (Block, u32);
 
+// Reorg fetching keeps only the current existing 100-header batch. Fetch and
+// writer errors stop the next RPC; no thread or second producer is introduced.
 pub struct SequentialFetcher<T> {
-    fetcher: Box<dyn FnOnce() -> Vec<Vec<T>>>,
+    fetcher: Box<dyn FnMut() -> Result<Option<Vec<T>>>>,
 }
 
 impl<T> SequentialFetcher<T> {
-    fn from<F: FnOnce() -> Vec<Vec<T>> + 'static>(pre_func: F) -> Self {
-        SequentialFetcher {
-            fetcher: Box::new(pre_func),
+    fn from<F: FnMut() -> Result<Option<Vec<T>>> + 'static>(func: F) -> Self {
+        Self {
+            fetcher: Box::new(func),
         }
     }
 
-    pub fn map<FN>(self, mut func: FN)
+    pub fn map<F>(mut self, mut func: F) -> Result<()>
     where
-        FN: FnMut(Vec<T>),
+        F: FnMut(Vec<T>) -> Result<()>,
     {
-        for item in (self.fetcher)() {
-            func(item);
+        while let Some(batch) = (self.fetcher)()? {
+            func(batch)?;
         }
+        Ok(())
     }
 }
 
@@ -68,49 +75,86 @@ pub fn bitcoind_sequential_fetcher(
     new_headers: Vec<HeaderEntry>,
 ) -> Result<SequentialFetcher<BlockEntry>> {
     let daemon = daemon.reconnect()?;
+    let mut offset = 0;
     Ok(SequentialFetcher::from(move || {
-        new_headers
-            .chunks(100)
-            .map(|entries| {
-                let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
-                let blocks = daemon
-                    .getblocks(&blockhashes)
-                    .expect("failed to get blocks from bitcoind");
-                assert_eq!(blocks.len(), entries.len());
-                let block_entries: Vec<BlockEntry> = blocks
-                    .into_iter()
-                    .zip(entries)
-                    .map(|(block, entry)| BlockEntry {
-                        entry: entry.clone(), // TODO: remove this clone()
-                        size: block.size() as u32,
-                        block,
-                    })
-                    .collect();
-                assert_eq!(block_entries.len(), entries.len());
-                block_entries
+        if offset == new_headers.len() {
+            return Ok(None);
+        }
+        let end = (offset + 100).min(new_headers.len());
+        let entries = &new_headers[offset..end];
+        let hashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
+        let blocks = daemon.getblocks(&hashes)?;
+        if blocks.len() != entries.len() {
+            return Err("incomplete bitcoind block batch".into());
+        }
+        let batch = blocks
+            .into_iter()
+            .zip(entries)
+            .map(|(block, entry)| BlockEntry {
+                entry: entry.clone(),
+                size: block.size() as u32,
+                block,
             })
-            .collect()
+            .collect();
+        offset = end;
+        Ok(Some(batch))
     }))
 }
 
 pub struct Fetcher<T> {
     receiver: crossbeam_channel::Receiver<T>,
-    thread: thread::JoinHandle<()>,
+    thread: thread::JoinHandle<Result<()>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<T> Fetcher<T> {
-    fn from(receiver: crossbeam_channel::Receiver<T>, thread: thread::JoinHandle<()>) -> Self {
-        Fetcher { receiver, thread }
+    fn from(
+        receiver: crossbeam_channel::Receiver<T>,
+        thread: thread::JoinHandle<Result<()>>,
+    ) -> Self {
+        Self::from_cancellable(receiver, thread, Arc::new(AtomicBool::new(false)))
     }
 
-    pub fn map<F>(self, mut func: F)
-    where
-        F: FnMut(T),
-    {
-        for item in self.receiver {
-            func(item);
+    fn from_cancellable(
+        receiver: crossbeam_channel::Receiver<T>,
+        thread: thread::JoinHandle<Result<()>>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Fetcher {
+            receiver,
+            thread,
+            cancelled,
         }
-        self.thread.join().expect("fetcher thread panicked")
+    }
+
+    pub fn map<F>(self, mut func: F) -> Result<()>
+    where
+        F: FnMut(T) -> Result<()>,
+    {
+        let Self {
+            receiver,
+            thread,
+            cancelled,
+        } = self;
+        // Drop the receiver even on callback panic, so a blocked owned producer
+        // can finish. Join before returning or unwinding; never detach work.
+        let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for item in receiver.iter() {
+                func(item)?;
+            }
+            Ok(())
+        }));
+        cancelled.store(true, Ordering::Release);
+        drop(receiver);
+        let produced = thread.join();
+        match consumed {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(Err(err)) => Err(err),
+            Ok(Ok(())) => match produced {
+                Ok(result) => result,
+                Err(_) => Err("fetcher thread panicked".into()),
+            },
+        }
     }
 }
 
@@ -124,15 +168,20 @@ fn bitcoind_fetcher(
     let daemon = daemon.reconnect()?;
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
-    Ok(Fetcher::from(
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let producer_cancelled = Arc::clone(&cancelled);
+    Ok(Fetcher::from_cancellable(
         chan.into_receiver(),
         spawn_thread("bitcoind_fetcher", move || {
             for entries in new_headers.chunks(100) {
+                if producer_cancelled.load(Ordering::Acquire) {
+                    return Err("block consumer stopped".into());
+                }
                 let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
-                let blocks = daemon
-                    .getblocks(&blockhashes)
-                    .expect("failed to get blocks from bitcoind");
-                assert_eq!(blocks.len(), entries.len());
+                let blocks = daemon.getblocks(&blockhashes)?;
+                if blocks.len() != entries.len() {
+                    return Err("incomplete bitcoind block batch".into());
+                }
                 let block_entries: Vec<BlockEntry> = blocks
                     .into_iter()
                     .zip(entries)
@@ -145,9 +194,11 @@ fn bitcoind_fetcher(
                 assert_eq!(block_entries.len(), entries.len());
                 sender
                     .send(block_entries)
-                    .expect("failed to send fetched blocks");
+                    .map_err(|_| Error::from("block consumer stopped"))?;
             }
+            Ok(())
         }),
+        cancelled,
     ))
 }
 
@@ -185,14 +236,16 @@ fn blkfiles_fetcher(
                 trace!("fetched {} blocks", block_entries.len());
                 sender
                     .send(block_entries)
-                    .expect("failed to send blocks entries from blk*.dat files");
-            });
+                    .map_err(|_| Error::from("block consumer stopped"))
+            })?;
             if !entry_map.is_empty() {
-                panic!(
+                return Err(format!(
                     "failed to index {} blocks from blk*.dat files",
                     entry_map.len()
                 )
+                .into());
             }
+            Ok(())
         }),
     ))
 }
@@ -217,8 +270,7 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
         spawn_thread("blkfiles_reader", move || {
             for path in blk_files {
                 trace!("reading {:?}", path);
-                let mut blob = fs::read(&path)
-                    .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e));
+                let mut blob = fs::read(&path).chain_err(|| "failed to read blk*.dat file")?;
 
                 // If the xor.dat exists. Use it to decrypt the block files.
                 if let Some(xor_key) = &xor_key {
@@ -229,8 +281,9 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
 
                 sender
                     .send(blob)
-                    .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
+                    .map_err(|_| Error::from("block parser stopped"))?;
             }
+            Ok(())
         }),
     )
 }
@@ -244,11 +297,11 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
         spawn_thread("blkfiles_parser", move || {
             blobs.map(|blob| {
                 trace!("parsing {} bytes", blob.len());
-                let blocks = parse_blocks(blob, magic).expect("failed to parse blk*.dat file");
+                let blocks = parse_blocks(blob, magic)?;
                 sender
                     .send(blocks)
-                    .expect("failed to send blocks from blk*.dat file");
-            });
+                    .map_err(|_| Error::from("block consumer stopped"))
+            })
         }),
     )
 }
@@ -301,4 +354,132 @@ fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
             .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))
             .collect()
     }))
+}
+
+#[cfg(test)]
+mod owned_fetch_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn sequential_fetch_and_write_interleave_without_prefetching() {
+        let progress = Arc::new(AtomicUsize::new(0));
+        let fetched = Arc::clone(&progress);
+        let mut next = 0;
+        let fetcher = SequentialFetcher::from(move || {
+            assert_eq!(fetched.load(Ordering::SeqCst), next);
+            if next == 3 {
+                return Ok(None);
+            }
+            next += 1;
+            Ok(Some(vec![next; 100]))
+        });
+        fetcher
+            .map(|batch| {
+                assert_eq!(batch.len(), 100);
+                progress.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(progress.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn sequential_writer_failure_stops_next_fetch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let fetcher = SequentialFetcher::from(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(vec![1]))
+        });
+        assert!(fetcher.map(|_| Err("delete failed".into())).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sequential_rpc_failure_never_calls_writer() {
+        let fetcher = SequentialFetcher::<u8>::from(|| Err("RPC failed".into()));
+        assert!(fetcher.map(|_| panic!("writer must not run")).is_err());
+    }
+
+    #[test]
+    fn consumer_failure_unblocks_and_joins_producer_preserving_original_error() {
+        let (sender, receiver) = crossbeam_channel::bounded(0);
+        let complete = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&complete);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let producer_cancelled = Arc::clone(&cancelled);
+        let producer = thread::spawn(move || {
+            sender.send(1).unwrap();
+            assert!(sender.send(2).is_err());
+            assert!(producer_cancelled.load(Ordering::Acquire));
+            observed.store(1, Ordering::SeqCst);
+            Err("producer observed cancellation".into())
+        });
+        let error = Fetcher::from_cancellable(receiver, producer, cancelled)
+            .map(|_| Err("delete failed".into()))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "delete failed");
+        assert_eq!(complete.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn consumer_panic_still_joins_owned_work_before_unwind() {
+        let (sender, receiver) = crossbeam_channel::bounded(0);
+        let complete = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&complete);
+        let producer = thread::spawn(move || {
+            sender.send(1).unwrap();
+            assert!(sender.send(2).is_err());
+            observed.store(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Fetcher::from(receiver, producer).map(|_| panic!("consumer panic"))
+        }))
+        .is_err());
+        assert_eq!(complete.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn producer_error_and_panic_are_not_successful_eof() {
+        let (sender, receiver) = crossbeam_channel::bounded::<u8>(1);
+        drop(sender);
+        let producer = thread::spawn(|| Err("RPC failed".into()));
+        assert_eq!(
+            Fetcher::from(receiver, producer)
+                .map(|_| Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "RPC failed"
+        );
+        let (sender, receiver) = crossbeam_channel::bounded::<u8>(1);
+        drop(sender);
+        let producer = thread::spawn(|| panic!("producer panic"));
+        assert!(Fetcher::from(receiver, producer).map(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn nested_parser_failure_joins_upstream_reader() {
+        let (raw_sender, raw_receiver) = crossbeam_channel::bounded(0);
+        let done = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&done);
+        let raw = thread::spawn(move || {
+            raw_sender.send(1).unwrap();
+            assert!(raw_sender.send(2).is_err());
+            observed.store(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let (sender, receiver) = crossbeam_channel::bounded::<u8>(0);
+        let parser = thread::spawn(move || {
+            let result = Fetcher::from(raw_receiver, raw).map(|_| Err("parse failed".into()));
+            drop(sender);
+            result
+        });
+        assert!(Fetcher::from(receiver, parser).map(|_| Ok(())).is_err());
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+    }
 }
