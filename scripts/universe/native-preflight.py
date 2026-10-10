@@ -12,9 +12,10 @@ import subprocess
 import sys
 
 DRAFT = '42ef9c89e2a4cab2865fdbe8c8bcb37e74256715'
-LOCK_SHA = 'd70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676'
+LOCK_SHA = 'a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236'
 SOURCE = pathlib.Path(__file__).resolve().parents[2]
-QUALIFICATION_SHA = '1a86886fb3a9b687004015877904164f4dd5aefdcd81f2ed8b5c7efba52a65e1'
+QUALIFICATION_SHA = '16f4fe4b89454d5d2061b4812ccc046a5aa83aadbbeb29cd56445316e403f26d'
+HISTORICAL_QUALIFICATION_SHA = '1a86886fb3a9b687004015877904164f4dd5aefdcd81f2ed8b5c7efba52a65e1'
 USER_SHOW = ['--user', 'show', '--property=Version,ControlGroup', '--no-pager']
 DOCKER_INFO = ['info', '--format', '{"serverVersion":"{{.ServerVersion}}","cgroupVersion":"{{.CgroupVersion}}","cgroupDriver":"{{.CgroupDriver}}","architecture":"{{.Architecture}}"}']
 DOCKER_IMAGES = ['image', 'ls', '--no-trunc', '--digests', '--filter', 'reference=rust:1.89.0*', '--format', '{{json .}}']
@@ -97,22 +98,31 @@ def cgroup_location(value):
 
 def cmake_requirement(lock_bytes, app_bytes, qualification_bytes):
     import tomllib
-    if hashlib.sha256(qualification_bytes).hexdigest() != QUALIFICATION_SHA:
+    qualification_sha = hashlib.sha256(qualification_bytes).hexdigest()
+    if qualification_sha not in [QUALIFICATION_SHA, HISTORICAL_QUALIFICATION_SHA]:
         raise ValueError('native requirement qualification byte drift')
     value = json.loads(qualification_bytes)
-    if value['schema'] != 'universe-electrs-native-tool-requirements-v1':
+    if value['schema'] not in ['universe-electrs-native-tool-requirements-v1', 'universe-electrs-native-tool-requirements-v2']:
         raise ValueError('unknown native requirement schema')
     if hashlib.sha256(lock_bytes).hexdigest() != value['cargoLockSha256'] or hashlib.sha256(app_bytes).hexdigest() != value['cargoTomlSha256']:
         raise ValueError('unknown lock/feature profile; CMake requirement needs review')
     lock = tomllib.loads(lock_bytes.decode())
     app = tomllib.loads(app_bytes.decode())
+    if value['schema'] == 'universe-electrs-native-tool-requirements-v2':
+        if qualification_sha != QUALIFICATION_SHA or value['cargoLockSha256'] != LOCK_SHA or value['profileEligibility'] != 'UNQUALIFIED_FINAL233_SELECTION' or value['cmakeRequired'] is not True:
+            raise ValueError('final profile cannot waive unresolved native tool selection')
+        if not any(package['name'] == 'cmake' and package['version'] == '0.1.54' for package in lock['package']):
+            raise ValueError('final CMake lock identity changed')
+        return {'required': True, 'qualificationSha256': qualification_sha, 'profileEligibility': value['profileEligibility'],
+                'selectionResolved': False, 'primarySourceReceiptSha256': value['sourceQualificationReceiptSha256'],
+                'archiveChecksumVerified': True, 'buildQualified': False}
     if any(package['name'] == 'cmake' for package in lock['package']) or 'zlib-ng' in app_bytes.decode():
         raise ValueError('introduced CMake/zlib-ng cannot be waived')
     if app['features'] != {'default': [], 'liquid': ['elements'], 'electrum-discovery': ['electrum-client']}:
         raise ValueError('unknown application features')
     if value['cmakeRequired'] is not False:
         raise ValueError('CMake classification requires review')
-    return {'required': False, 'qualificationSha256': QUALIFICATION_SHA,
+    return {'required': False, 'qualificationSha256': HISTORICAL_QUALIFICATION_SHA, 'profileEligibility': 'HISTORICAL_OLD204_ONLY',
             'primarySourceReceiptSha256': value['sourceQualificationReceiptSha256'],
             'archiveChecksumVerified': False, 'buildQualified': False}
 
@@ -187,7 +197,7 @@ def collect():
         raise ValueError('owned Linux x86_64 runner required')
     if os.environ.get('GITHUB_REPOSITORY') != 'bitcoinuniverseio/electrs':
         raise ValueError('owned fork only')
-    if os.environ.get('GITHUB_REF') != 'refs/heads/codex/bounded-script-utxo-pages':
+    if os.environ.get('GITHUB_REF') != 'refs/heads/develop':
         raise ValueError('reviewed draft branch only')
     expected = os.environ.get('EXPECTED_SOURCE_SHA', '')
     if not re.fullmatch('[0-9a-f]{40}', expected):

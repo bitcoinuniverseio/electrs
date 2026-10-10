@@ -18,6 +18,24 @@ TOOLS = ['/usr/bin/x86_64-linux-gnu-as', '/usr/bin/x86_64-linux-gnu-ld.bfd', '/u
 TREES = [RUST + '/lib', '/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include',
          '/usr/lib/gcc/x86_64-linux-gnu/13/include-fixed']
 LIBRARY_ROOTS = [RUST + '/lib', LLVM + '/lib', '/usr/lib/llvm-18/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib/gcc/x86_64-linux-gnu/13']
+SAFE_FAILURE_CODES = {
+    'ELF string table bound': 'ELF_STRING_TABLE_BOUND',
+    'dynamic segment invalid': 'ELF_DYNAMIC_SEGMENT_BOUND',
+    'compiler RUNPATH outside reviewed library roots': 'ELF_RUNPATH_UNREVIEWED',
+    'linked compiler tree directory requires reviewed resolution': 'SDK_DIRECTORY_LINK_UNREVIEWED',
+    'compiler tree link leaves exact read tree': 'SDK_LINK_ESCAPE',
+    'compiler resolved leaf outside exact reviewed roots': 'RESOLVED_LEAF_OUTSIDE_ALLOWLIST',
+    'compiler closure read/file/time bound': 'CLOSURE_READ_FILE_TIME_BOUND',
+    'compiler directory/entry/time bound': 'DIRECTORY_ENTRY_TIME_BOUND',
+    'cumulative compiler ELF read bound': 'ELF_TOTAL_READ_BOUND',
+}
+
+
+def failure_report(progress, error):
+    code = SAFE_FAILURE_CODES.get(error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) else None)
+    if code is None:
+        code = 'OS_RESOURCE_UNAVAILABLE' if isinstance(error, OSError) else progress.get('failureCode', 'METADATA_GUARD_REJECTED')
+    return {**progress, 'observationComplete': False, 'failureType': type(error).__name__, 'failureCode': code}
 
 
 def load(name, file):
@@ -135,10 +153,12 @@ def collect(progress=None):
     parser = load('bounded_compiler_elf', 'inspect-fuse-packages.py'); budget = Budget(); records = {}; missing = []
     queue = []
     for role, (path, expected) in known.items():
+        progress.update({'phase': 'pin-primary', 'currentRole': role, 'currentLeaf': pathlib.Path(path).name, 'failureCode': 'PRIMARY_PIN_REJECTED'})
         record = pin_file(path, budget)
         if record['sha256'] != expected: raise ValueError('observed primary compiler pin changed: ' + role)
         record['role'] = role; records[record['path']] = record; queue.append(record['path'])
     for path in TOOLS:
+        progress.update({'phase': 'pin-compiler-tool', 'currentRole': 'compiler-tool', 'currentLeaf': pathlib.Path(path).name, 'failureCode': 'COMPILER_TOOL_PIN_REJECTED'})
         if not pathlib.Path(path).is_file(): missing.append({'role': 'compiler-tool', 'path': path}); continue
         record = pin_file(path, budget); record['role'] = 'compiler-tool'; records[record['path']] = record; queue.append(record['path'])
     seen = set()
@@ -146,6 +166,7 @@ def collect(progress=None):
         path = queue.pop(0)
         if path in seen: continue
         if len(seen) >= 128: raise ValueError('bounded compiler ELF dependency count')
+        progress.update({'phase': 'parse-compiler-elf', 'currentRole': records[path]['role'], 'currentLeaf': pathlib.Path(path).name, 'failureCode': 'ELF_PARSE_REJECTED'})
         seen.add(path); metadata = elf(path, parser, budget, records[path]); records[path]['elf'] = metadata
         if metadata is None: continue
         roots = list(LIBRARY_ROOTS)
@@ -157,11 +178,16 @@ def collect(progress=None):
         dependencies = list(metadata['needed'])
         if metadata['interpreter']: dependencies.append('ld-linux-x86-64.so.2')
         for name in dependencies:
+            progress.update({'phase': 'resolve-compiler-dependency', 'currentRole': 'compiler-library', 'currentLeaf': name, 'failureCode': 'ELF_DEPENDENCY_REJECTED'})
             candidates = {str((pathlib.Path(root) / name).resolve(strict=True)) for root in roots if (pathlib.Path(root) / name).is_file()}
             if len(candidates) != 1: missing.append({'role': 'unresolved-or-ambiguous-ELF', 'name': name, 'from': path}); continue
             target = next(iter(candidates))
             if target not in records: records[target] = pin_file(target, budget); records[target]['role'] = 'compiler-library'; queue.append(target)
-    trees = [tree_pin(path, budget) for path in TREES]
+    trees = []
+    for index, path in enumerate(TREES):
+        progress.update({'phase': 'pin-sdk-tree', 'currentRole': 'sdk-tree-' + str(index), 'currentLeaf': pathlib.Path(path).name, 'failureCode': 'SDK_TREE_REJECTED'})
+        trees.append(tree_pin(path, budget))
+    progress.update({'phase': 'final-source-guard', 'currentRole': 'source', 'currentLeaf': None, 'failureCode': 'SOURCE_DRIFT_REJECTED'})
     guard.source_guard(git, source)
     return {**progress, 'schema': 'universe-electrs-existing-compiler-closure-metadata-v1', 'sourceSha': source,
             'leaves': list(records.values()), 'trees': trees, 'missing': missing, 'readBytes': budget.bytes, 'readFiles': budget.files,
@@ -182,7 +208,7 @@ def main():
         result = collect(progress)
     except Exception as error:
         # Exception text may include private paths or environment data: type only.
-        result = {**progress, 'observationComplete': False, 'failureType': type(error).__name__}
+        result = failure_report(progress, error)
     raw = json.dumps(result, separators=(',', ':')).encode()
     if len(raw) > 8 * 1024**2: raise ValueError('compiler closure report bound')
     import sys

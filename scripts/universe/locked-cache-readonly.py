@@ -37,7 +37,7 @@ def bounded_read(path, maximum=32768):
 def runtime_guard():
     if platform.system() != 'Linux' or os.getuid() != 1001 or os.environ.get('GITHUB_REPOSITORY') != 'bitcoinuniverseio/electrs':
         raise ValueError('exact owned Linux account/repository required')
-    if os.environ.get('GITHUB_REF') != 'refs/heads/codex/bounded-script-utxo-pages':
+    if os.environ.get('GITHUB_REF') != 'refs/heads/develop':
         raise ValueError('owned branch required')
     if not sys.dont_write_bytecode or not sys.flags.isolated or not sys.flags.no_site:
         raise ValueError('existing Python -B -I -S required; no bytecode/site effects')

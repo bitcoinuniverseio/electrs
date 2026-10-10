@@ -17,13 +17,22 @@ class PreflightTests(unittest.TestCase):
     def setUpClass(cls):
         cls.lock = subprocess.check_output(['git', 'show', '2fc865c06f3eb7f18387868db34bfc2ca71dde6f:Cargo.lock'], cwd=PREFLIGHT.SOURCE)
         cls.app = subprocess.check_output(['git', 'show', '2fc865c06f3eb7f18387868db34bfc2ca71dde6f:Cargo.toml'], cwd=PREFLIGHT.SOURCE)
-        cls.qualification = PATH.with_name('native-tool-requirements.json').read_bytes()
+        cls.qualification = subprocess.check_output(['git', 'show', '0328124ccd41ef69d32c8e202b838777c58b9014:scripts/universe/native-tool-requirements.json'], cwd=PREFLIGHT.SOURCE)
 
     def test_exact_source_qualified_cmake_is_optional_not_full_build(self):
         result = PREFLIGHT.cmake_requirement(self.lock, self.app, self.qualification)
         self.assertFalse(result['required'])
         self.assertFalse(result['buildQualified'])
-        self.assertEqual(result['qualificationSha256'], PREFLIGHT.QUALIFICATION_SHA)
+        self.assertEqual(result['qualificationSha256'], PREFLIGHT.HISTORICAL_QUALIFICATION_SHA)
+        self.assertEqual(result['profileEligibility'], 'HISTORICAL_OLD204_ONLY')
+
+    def test_final233_profile_stays_unqualified_and_cannot_borrow_old_waiver(self):
+        lock = subprocess.check_output(['git', 'show', 'HEAD:Cargo.lock'], cwd=PREFLIGHT.SOURCE)
+        app = subprocess.check_output(['git', 'show', 'HEAD:Cargo.toml'], cwd=PREFLIGHT.SOURCE)
+        raw = PATH.with_name('native-tool-requirements.json').read_bytes()
+        result = PREFLIGHT.cmake_requirement(lock, app, raw)
+        self.assertTrue(result['required']); self.assertFalse(result['selectionResolved']); self.assertFalse(result['buildQualified'])
+        with self.assertRaises(ValueError): PREFLIGHT.cmake_requirement(lock, app, self.qualification)
 
     def test_new_cmake_lock_zlib_ng_unknown_features_or_receipt_reject(self):
         changes = [(self.lock + b'\n[[package]]\nname="cmake"\nversion="0.1.44"\n', self.app, self.qualification),
@@ -165,7 +174,8 @@ class PreflightTests(unittest.TestCase):
         raw = workflow.read_text()
         self.assertIn('workflow_dispatch:', raw)
         self.assertNotIn('pull_request:', raw)
-        self.assertIn('branches: [codex/bounded-script-utxo-pages]', raw)
+        self.assertIn('branches: [develop]', raw)
+        self.assertIn("github.ref == 'refs/heads/develop'", raw)
         self.assertIn('      - scripts/universe/native-preflight.py', raw)
         self.assertIn('      - scripts/universe/native-preflight.test.py', raw)
         self.assertNotIn('branches: [mempool]', raw)

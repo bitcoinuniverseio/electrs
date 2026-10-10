@@ -179,7 +179,7 @@ class Controls(unittest.TestCase):
     def test_premerge_vendor_rejected_before_any_tool(self):
         root = pathlib.PurePosixPath('/opt/github-runners/runner-27/_work/_temp/universe-electrs-build-123-1-' + 'a' * 16)
         context = {'schema': 'universe-electrs-full-cargo-worker-v1', 'sourceSha': 'a' * 40,
-                   'cargoLockSha256': 'b' * 64, 'vendorLockSha256': 'c' * 64, 'profile': 'unchanged-default', 'operation': 'test'}
+                   'cargoLockSha256': module.FINAL_LOCK_SHA, 'vendorLockSha256': 'c' * 64, 'profile': 'unchanged-default', 'operation': 'test'}
         for key in ['sourceRoot', 'vendorRoot', 'wrapperBinary', 'readRootsFile', 'packageRoot']: context[key] = str(root / key)
         with patch.object(module, 'under', side_effect=lambda path, _: pathlib.PurePosixPath(path)):
             with self.assertRaisesRegex(ValueError, 'premerge'): module.context_check(context, root)
