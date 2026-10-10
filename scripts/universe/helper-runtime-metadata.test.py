@@ -23,7 +23,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(b'"metadataRead": false', result.stdout)
 
     def test_exact_fixed_library_paths(self):
-        self.assertEqual(set(runtime.LIBRARIES), {'libc.so.6', 'libcom_err.so.2', 'libblkid.so.1', 'libuuid.so.1', 'ld-linux-x86-64.so.2'})
+        self.assertEqual(set(runtime.LIBRARIES), {'libc.so.6', 'libcom_err.so.2', 'libblkid.so.1', 'libuuid.so.1', 'libext2fs.so.2', 'libe2p.so.2', 'ld-linux-x86-64.so.2'})
         self.assertTrue(all(path.startswith(('/usr/lib/x86_64-linux-gnu/', '/lib64/')) for path in runtime.LIBRARIES.values()))
 
     def test_missing_library_unqualified(self):

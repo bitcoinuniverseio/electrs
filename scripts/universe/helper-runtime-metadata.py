@@ -12,10 +12,13 @@ LIBRARIES = {'libc.so.6': '/usr/lib/x86_64-linux-gnu/libc.so.6',
              'libcom_err.so.2': '/usr/lib/x86_64-linux-gnu/libcom_err.so.2',
              'libblkid.so.1': '/usr/lib/x86_64-linux-gnu/libblkid.so.1',
              'libuuid.so.1': '/usr/lib/x86_64-linux-gnu/libuuid.so.1',
+             'libext2fs.so.2': '/usr/lib/x86_64-linux-gnu/libext2fs.so.2',
+             'libe2p.so.2': '/usr/lib/x86_64-linux-gnu/libe2p.so.2',
              'ld-linux-x86-64.so.2': '/lib64/ld-linux-x86-64.so.2'}
 REQUIRED_VERSIONS = {'libc.so.6': {'GLIBC_2.38', 'GLIBC_2.34'}, 'libblkid.so.1': {'BLKID_1.0'}, 'libuuid.so.1': {'UUID_1.0'}}
 READELF_SHA = '64c58e15274bbbb5153f31078e455e9e77ee5f51489e709bba5bb788ce9df2b0'
 MKE2FS_SHA = '07cd24ce58a410cc9cee93c55ae5ac95986df016c5907dc7a49b55389bd41ed2'
+FUSERMOUNT_SHA = 'd278775c1528dd32efc85c2cb322423ee93aa8dcf76aaa595f7022d427910704'
 
 
 def load(name, filename):
@@ -50,6 +53,13 @@ def collect():
     mke_raw = mke2fs.read_bytes()
     if hashlib.sha256(mke_raw).hexdigest() != MKE2FS_SHA: raise ValueError('actual a770 mke2fs pin mismatch')
     mke_elf = parser.elf_metadata(mke_raw)
+    fusermount = pathlib.Path('/usr/bin/fusermount3').resolve(strict=True)
+    if str(fusermount) != '/usr/bin/fusermount3' or fusermount.stat().st_size > 8 * 1024**2: raise ValueError('observed fusermount3 path/type/size')
+    fuse_raw = fusermount.read_bytes()
+    if hashlib.sha256(fuse_raw).hexdigest() != FUSERMOUNT_SHA: raise ValueError('actual fusermount3 pin mismatch')
+    fuse_elf = parser.elf_metadata(fuse_raw)
+    registered = {line.split()[-1] for line in guard.bounded_read('/proc/filesystems', 8192).splitlines() if line.split()}
+    uname = os.uname()
     readelf = pathlib.Path('/usr/bin/readelf').resolve(strict=True)
     if str(readelf) != '/usr/bin/x86_64-linux-gnu-readelf' or hashlib.sha256(readelf.read_bytes()).hexdigest() != READELF_SHA:
         raise ValueError('previously observed readelf pin mismatch')
@@ -57,6 +67,11 @@ def collect():
               'observedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'libraries': records,
               'readelf': {'path': str(readelf), 'sha256': READELF_SHA, 'executed': False},
               'mke2fs': {'path': str(mke2fs), 'sha256': MKE2FS_SHA, 'elf': mke_elf, 'executed': False},
+              'fusermount3': {'path': str(fusermount), 'sha256': FUSERMOUNT_SHA, 'elf': fuse_elf,
+                             'setuidObserved': bool(fusermount.stat().st_mode & 0o4000), 'executed': False},
+              'kernelFuseMetadata': {'kernelRelease': uname.release[:128], 'machine': uname.machine[:40],
+                                     'registeredFilesystems': sorted(registered & {'fuse', 'fuseblk', 'fusectl'}),
+                                     'deviceOpened': False, 'protocolNegotiationObserved': False},
               'hostAbiVersionDefinitionsObserved': all(record['abiQualified'] for record in records),
               'isolatedPackageAndHostClosureQualified': False, 'helperExecuted': False, 'loaderExecuted': False,
               'deviceOpened': False, 'mounted': False, 'cargoInvoked': False, 'nativeActions': False}
