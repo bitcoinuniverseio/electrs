@@ -35,3 +35,13 @@ An existing shared tmpfs8GiB size alone does not reserve or enforce an8GiB ceili
 for this owned target. Per-file RLIMIT_FSIZE, memory cgroups and periodic directory
 measurement do not independently enforce aggregate target storage. No conclusion
 about current facilities is made before actual owned CI observation.
+
+The actual616 observation reported accessible character `/dev/fuse`, existing
+setuid fusermount3 and mke2fs, but no effective self capabilities and an
+unsuccessful noninteractive sudo policy listing. That does not prove no sudo
+rights universally. The next bounded metadata successor checks only exact
+`/usr/bin/fuse2fs` and `/usr/sbin/fuse2fs` files plus named public libfuse headers
+and shared libraries. It invokes none of them. If existing fuse2fs is observed,
+a separately reviewed small private fixed-size ext4 image/FUSE proof may resolve
+the aggregate storage route without installations, new privileges or host policy
+changes. No such proof or mount has run in this successor.
