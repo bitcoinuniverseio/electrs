@@ -1,0 +1,19 @@
+{
+  "schema": "universe-electrs-native-tool-requirements-v1",
+  "status": "REVIEWED_SOURCE_REQUIREMENTS_ONLY_NOT_BUILD_QUALIFICATION",
+  "cargoLockSha256": "d70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676",
+  "cargoTomlSha256": "850b52199483aa2162da93d23918fc97b3be9a64111175a239c829e6af2c0a08",
+  "sourceQualificationReceiptSha256": "632b0cbe389a2748cb7a653f178c3bb2bd0e0d62eebdb15f3e6e6a68f3d199e8",
+  "sourceQualificationTrust": "Locally reviewed primary published source captures, not verified crate archive checksum or native build proof",
+  "selectedProfile": "unchanged application default/liquid/electrum-discovery; no dependency-feature overrides",
+  "cmakeRequired": false,
+  "cmakeDecision": "libz-sys1.1.9 optional zlib-ng only; librocksdb-sys disables defaults and enables static; no zlib-ng activation or cmake lock package",
+  "requiresRequalification": ["changed Cargo.lock", "changed Cargo.toml/features", "zlib-ng", "cmake lock entry"],
+  "primarySources": [
+    "https://docs.rs/crate/libz-sys/1.1.9/source/Cargo.toml",
+    "https://docs.rs/crate/libz-sys/1.1.9/source/build.rs",
+    "https://docs.rs/crate/librocksdb-sys/0.17.3%2B10.4.2/source/Cargo.toml",
+    "https://docs.rs/crate/librocksdb-sys/0.17.3%2B10.4.2/source/build.rs",
+    "https://docs.rs/crate/rocksdb/0.24.0/source/Cargo.toml"
+  ]
+}

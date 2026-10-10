@@ -8,6 +8,7 @@ on:
       - .github/workflows/universe-native-preflight.yml
       - scripts/universe/native-preflight.py
       - scripts/universe/native-preflight.test.py
+      - scripts/universe/native-tool-requirements.json
 
 permissions:
   contents: read

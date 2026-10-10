@@ -7,12 +7,17 @@ import pathlib
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
 DRAFT = '42ef9c89e2a4cab2865fdbe8c8bcb37e74256715'
 LOCK_SHA = 'd70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676'
 SOURCE = pathlib.Path(__file__).resolve().parents[2]
+QUALIFICATION_SHA = '1a86886fb3a9b687004015877904164f4dd5aefdcd81f2ed8b5c7efba52a65e1'
+USER_SHOW = ['--user', 'show', '--property=Version,ControlGroup', '--no-pager']
+DOCKER_INFO = ['info', '--format', '{"serverVersion":"{{.ServerVersion}}","cgroupVersion":"{{.CgroupVersion}}","cgroupDriver":"{{.CgroupDriver}}","architecture":"{{.Architecture}}"}']
+DOCKER_IMAGES = ['image', 'ls', '--no-trunc', '--digests', '--filter', 'reference=rust:1.89.0*', '--format', '{{json .}}']
 
 
 def read_small(path, maximum=65536):
@@ -23,7 +28,7 @@ def read_small(path, maximum=65536):
     return raw.decode('utf8').strip()
 
 
-def run_metadata(argv, cwd=SOURCE, version_tool=None):
+def run_metadata(argv, cwd=SOURCE, version_tool=None, metadata_role=None):
     if not argv or not pathlib.Path(argv[0]).is_absolute():
         raise ValueError('absolute existing metadata executable required')
     name = pathlib.Path(argv[0]).name
@@ -31,12 +36,30 @@ def run_metadata(argv, cwd=SOURCE, version_tool=None):
     allowed = name == 'git' and (tail in [['rev-parse', 'HEAD'], ['status', '--porcelain']]
                                 or len(tail) == 4 and tail[:3] == ['merge-base', '--is-ancestor', DRAFT])
     allowed = allowed or name == 'rustc' and tail in [['-Vv'], ['--print', 'target-list']]
-    version_path = shutil.which(version_tool) if version_tool in ['cc', 'c++', 'clang', 'cmake'] else None
+    version_path = shutil.which(version_tool) if version_tool in ['cc', 'c++', 'clang', 'cmake', 'docker'] else None
     allowed = allowed or (version_path is not None and tail == ['--version']
                           and pathlib.Path(version_path).resolve() == pathlib.Path(argv[0]))
+    roles = {'user-manager': ('systemctl', USER_SHOW), 'docker-info': ('docker', DOCKER_INFO),
+             'docker-images': ('docker', DOCKER_IMAGES)}
+    role = roles.get(metadata_role)
+    role_path = shutil.which(role[0]) if role else None
+    allowed = allowed or (role_path is not None and tail == role[1]
+                          and pathlib.Path(role_path).resolve() == pathlib.Path(argv[0]))
     if not allowed:
         raise ValueError('preflight metadata command only; cargo/install/build forbidden')
-    result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=5, check=True)
+    env = None
+    if role:
+        env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'HOME': str(pathlib.Path.home())}
+        if metadata_role == 'user-manager':
+            env['XDG_RUNTIME_DIR'] = '/run/user/' + str(os.getuid())
+            env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + env['XDG_RUNTIME_DIR'] + '/bus'
+        else:
+            env['DOCKER_HOST'] = 'unix:///var/run/docker.sock'
+            # Do not read inherited Docker credentials/context/configuration.
+            env['DOCKER_CONFIG'] = '/run/user/' + str(os.getuid()) + '/electrs-preflight-no-docker-config'
+            if pathlib.Path(env['DOCKER_CONFIG']).exists():
+                raise ValueError('unexpected docker configuration path exists')
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=5, check=True, env=env)
     if len(result.stdout) > 65536 or len(result.stderr) > 8192:
         raise ValueError('metadata command output bound')
     return result.stdout.decode('utf8').strip()
@@ -72,6 +95,93 @@ def cgroup_location(value):
     return pathlib.Path('/sys/fs/cgroup') / rows[0].lstrip('/')
 
 
+def cmake_requirement(lock_bytes, app_bytes, qualification_bytes):
+    import tomllib
+    if hashlib.sha256(qualification_bytes).hexdigest() != QUALIFICATION_SHA:
+        raise ValueError('native requirement qualification byte drift')
+    value = json.loads(qualification_bytes)
+    if value['schema'] != 'universe-electrs-native-tool-requirements-v1':
+        raise ValueError('unknown native requirement schema')
+    if hashlib.sha256(lock_bytes).hexdigest() != value['cargoLockSha256'] or hashlib.sha256(app_bytes).hexdigest() != value['cargoTomlSha256']:
+        raise ValueError('unknown lock/feature profile; CMake requirement needs review')
+    lock = tomllib.loads(lock_bytes.decode())
+    app = tomllib.loads(app_bytes.decode())
+    if any(package['name'] == 'cmake' for package in lock['package']) or 'zlib-ng' in app_bytes.decode():
+        raise ValueError('introduced CMake/zlib-ng cannot be waived')
+    if app['features'] != {'default': [], 'liquid': ['elements'], 'electrum-discovery': ['electrum-client']}:
+        raise ValueError('unknown application features')
+    if value['cmakeRequired'] is not False:
+        raise ValueError('CMake classification requires review')
+    return {'required': False, 'qualificationSha256': QUALIFICATION_SHA,
+            'primarySourceReceiptSha256': value['sourceQualificationReceiptSha256'],
+            'archiveChecksumVerified': False, 'buildQualified': False}
+
+
+def socket_present(path):
+    try:
+        return stat.S_ISSOCK(pathlib.Path(path).lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def user_manager_metadata():
+    uid = os.getuid()
+    bus = pathlib.Path('/run/user') / str(uid) / 'bus'
+    value = {'busPath': str(bus), 'busSocketPresent': socket_present(bus), 'managerObserved': False,
+             'unitCreated': False, 'settingsChanged': False}
+    tool = shutil.which('systemctl')
+    if tool:
+        value['tool'] = file_pin(tool)
+    if value['busSocketPresent'] and tool:
+        try:
+            response = run_metadata([value['tool']['path'], *USER_SHOW], metadata_role='user-manager')
+            pairs = dict(line.split('=', 1) for line in response.splitlines() if '=' in line)
+            if set(pairs) - {'Version', 'ControlGroup'}:
+                raise ValueError('unexpected manager metadata fields')
+            value['properties'] = pairs
+            value['managerObserved'] = bool(pairs.get('Version'))
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            value['errorType'] = type(error).__name__
+            value['exitCode'] = getattr(error, 'returncode', None)
+    return value
+
+
+def docker_metadata():
+    value = {'socketPath': '/var/run/docker.sock', 'socketPresent': socket_present('/var/run/docker.sock'),
+             'serverObserved': False, 'images': [], 'imagesPulled': False, 'containersStarted': False}
+    tool = shutil.which('docker')
+    if not tool:
+        value['clientPresent'] = False
+        return value
+    value['clientPresent'] = True
+    value['tool'] = file_pin(tool)
+    value['clientVersion'] = run_metadata([value['tool']['path'], '--version'], version_tool='docker')
+    if not value['socketPresent']:
+        return value
+    try:
+        info = json.loads(run_metadata([value['tool']['path'], *DOCKER_INFO], metadata_role='docker-info'))
+        if set(info) != {'serverVersion', 'cgroupVersion', 'cgroupDriver', 'architecture'}:
+            raise ValueError('unexpected Docker metadata')
+        value['server'] = info
+        value['serverObserved'] = True
+        rows = run_metadata([value['tool']['path'], *DOCKER_IMAGES], metadata_role='docker-images').splitlines()
+        if len(rows) > 32:
+            raise ValueError('existing image summary bound')
+        for raw in rows:
+            item = json.loads(raw)
+            if item['Repository'] not in ['rust', 'docker.io/library/rust'] or not re.fullmatch(r'1\.89\.0(?:[-a-z0-9.]+)?', item['Tag']):
+                raise ValueError('nonallowlisted image identity')
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', item['ID']):
+                raise ValueError('invalid existing image ID')
+            if item.get('Digest') not in [None, '<none>'] and not re.fullmatch(r'sha256:[0-9a-f]{64}', item['Digest']):
+                raise ValueError('invalid existing image digest')
+            value['images'].append({key: item.get(key) for key in ['Repository', 'Tag', 'ID', 'Digest']})
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        value['errorType'] = type(error).__name__
+        value['exitCode'] = getattr(error, 'returncode', None)
+    return value
+
+
 def collect():
     if platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise ValueError('owned Linux x86_64 runner required')
@@ -94,12 +204,14 @@ def collect():
     lock = (SOURCE / 'Cargo.lock').read_bytes()
     if hashlib.sha256(lock).hexdigest() != LOCK_SHA:
         raise ValueError('original lock drift')
+    cmake = cmake_requirement(lock, (SOURCE / 'Cargo.toml').read_bytes(),
+                              pathlib.Path(__file__).with_name('native-tool-requirements.json').read_bytes())
     report = {'schema': 'universe-electrs-linux-preflight-v1',
               'observedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
               'sourceSha': head, 'draftAncestor': DRAFT, 'lockSha256': LOCK_SHA,
               'tools': {'git': git_pin}, 'missing': [], 'nativeActions': False, 'cargoInvoked': False,
               'compiled': False, 'dependencyFetch': False, 'installed': False,
-              'fullAdapterQualification': False}
+              'fullAdapterQualification': False, 'cmakeRequirement': cmake, 'optionalMissing': []}
     home = pathlib.Path.home()
     # Exactly this version/target, never rustup shims, PATH Rust or another version.
     rust_bin = home / '.rustup/toolchains/1.89.0-x86_64-unknown-linux-gnu/bin'
@@ -132,7 +244,10 @@ def collect():
     for name in ['cc', 'c++', 'clang', 'cmake', 'unshare', 'systemd-run']:
         path = shutil.which(name)
         if not path:
-            report['missing'].append('existing-' + name)
+            if name == 'cmake' and not cmake['required']:
+                report['optionalMissing'].append('existing-cmake-unrequired-for-exact-reviewed-profile')
+            else:
+                report['missing'].append('existing-' + name)
             continue
         report['tools'][name] = file_pin(path)
         if name in ['cc', 'c++', 'clang', 'cmake']:
@@ -161,6 +276,10 @@ def collect():
     user_limit = pathlib.Path('/proc/sys/user/max_user_namespaces')
     report['maxUserNamespaces'] = int(read_small(user_limit, 64)) if user_limit.is_file() else None
     report['sandboxCreationProven'] = False
+    report['userManager'] = user_manager_metadata()
+    if not report['userManager']['managerObserved']:
+        report['dockerAvailability'] = docker_metadata()
+    report['buildAdmissionQualified'] = False
     report['durableHeadroomProven'] = False
     report['nextGates'] = ['Reviewed tool hashes/version and full locked Linux source build',
                            'Controlled owned resource/network sandbox creation proof',
