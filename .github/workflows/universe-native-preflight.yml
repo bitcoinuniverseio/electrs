@@ -1,4 +1,4 @@
-name: Universe exact locked cache inventory only
+name: Universe storage enforcement capability metadata only
 
 on:
   workflow_dispatch:
@@ -23,6 +23,8 @@ on:
       - scripts/universe/locked-source-inventory.test.py
       - scripts/universe/locked-cache-readonly.py
       - scripts/universe/locked-cache-readonly.test.py
+      - scripts/universe/storage-enforcement-metadata.py
+      - scripts/universe/storage-enforcement-metadata.test.py
 
 permissions:
   contents: read
@@ -43,10 +45,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Observe exact locked source cache without Cargo or unit creation
+      - name: Observe existing storage enforcement facilities without actions
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3.12 -B -I -S scripts/universe/locked-cache-readonly.py --observe-owned-cache
+          /usr/bin/python3.12 -B -I -S scripts/universe/storage-enforcement-metadata.py --observe-owned-storage
