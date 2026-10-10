@@ -179,16 +179,12 @@ pub fn index_confirmed_tx_assets(
     network: Network,
     parent_network: BNetwork,
     rows: &mut Vec<DBRow>,
-    op: &Operation,
+    _op: &Operation,
 ) {
     let (history, issuances) = index_tx_assets(tx, network, parent_network);
 
     rows.extend(history.into_iter().map(|(asset_id, info)| {
         let history_row = asset_history_row(&asset_id, confirmed_height, tx_position, info);
-        if let Operation::DeleteBlocksWithHistory(tx) = op {
-            tx.send(history_row.key.hash)
-                .expect("unbounded channel won't fail");
-        }
         history_row.into_row()
     }));
 

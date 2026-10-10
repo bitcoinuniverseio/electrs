@@ -415,6 +415,144 @@ pub fn open_raw_db<T: rocksdb::ThreadMode>(
     }
 }
 
+// Sole-writer cache invalidation, bounded independently of reorg length and
+// duplicate script/asset occurrences. No channel, set, new DB owner or scan.
+pub(crate) const CACHE_DELETE_KEYS: usize = 500;
+pub(crate) fn delete_cache_chunks<K, E>(
+    keys: impl IntoIterator<Item = Result<K, E>>,
+    mut apply: impl FnMut(Vec<K>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut chunk = Vec::with_capacity(CACHE_DELETE_KEYS);
+    for key in keys {
+        chunk.push(key?);
+        if chunk.len() == CACHE_DELETE_KEYS {
+            apply(std::mem::replace(
+                &mut chunk,
+                Vec::with_capacity(CACHE_DELETE_KEYS),
+            ))?;
+        }
+    }
+    if !chunk.is_empty() {
+        apply(chunk)?;
+    }
+    Ok(())
+}
+
+// TxHistoryKey's existing fixed-array big-endian serialization starts with
+// code:u8, hash:[u8;32]. H script and Liquid I asset hashes shared the exact
+// former callback. A/U/z key construction is unchanged, including duplicates.
+pub(crate) fn history_cache_keys(key: &[u8], liquid: bool) -> Result<Vec<Vec<u8>>, &'static str> {
+    if key.first() != Some(&b'H') && !(liquid && key.first() == Some(&b'I')) {
+        return Ok(vec![]);
+    }
+    let hash = key.get(1..33).ok_or("malformed history cache hash")?;
+    let mut keys = vec![[b"A", hash].concat(), [b"U", hash].concat()];
+    if liquid {
+        keys.push([b"z", hash].concat());
+    }
+    Ok(keys)
+}
+
+#[cfg(test)]
+mod bounded_cache_delete_tests {
+    use super::{delete_cache_chunks, history_cache_keys, CACHE_DELETE_KEYS};
+    #[test]
+    fn exact_bitcoin_and_liquid_callback_hashes_preserved() {
+        for code in [b'H', b'I'] {
+            let history = [&[code][..], &[7; 32][..], &[9; 64][..]].concat();
+            for liquid in [false, true] {
+                let keys = history_cache_keys(&history, liquid).unwrap();
+                if code == b'I' && !liquid {
+                    assert!(keys.is_empty());
+                    continue;
+                }
+                let prefixes = if liquid {
+                    vec![b'A', b'U', b'z']
+                } else {
+                    vec![b'A', b'U']
+                };
+                assert_eq!(
+                    keys,
+                    prefixes
+                        .into_iter()
+                        .map(|prefix| [&[prefix][..], &[7; 32][..]].concat())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for code in [b'D', b'S', b'a', b'i'] {
+            assert!(history_cache_keys(&[code; 33], true).unwrap().is_empty());
+        }
+        assert!(history_cache_keys(b"H", false).is_err());
+        assert!(history_cache_keys(b"I", true).is_err());
+    }
+    #[test]
+    fn dense_duplicates_stream_exactly_without_reorg_wide_retention() {
+        let mut visits = 0;
+        let mut applied = vec![];
+        let keys = (0..1501).map(|index| {
+            visits += 1;
+            Ok::<_, ()>(index % 7)
+        });
+        delete_cache_chunks(keys, |keys| {
+            assert!(keys.len() <= CACHE_DELETE_KEYS);
+            applied.extend(keys);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visits, 1501);
+        assert_eq!(
+            applied,
+            (0..1501).map(|index| index % 7).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn failed_chunk_stops_iteration_and_exact_replay_can_finish() {
+        use std::cell::Cell;
+        let visits = Cell::new(0);
+        let mut calls = vec![];
+        let result = delete_cache_chunks(
+            (0..1501).map(|index| {
+                visits.set(visits.get() + 1);
+                Ok(index)
+            }),
+            |keys| {
+                calls.push(keys);
+                if calls.len() == 2 {
+                    Err("cache delete failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err("cache delete failed"));
+        assert_eq!(visits.get(), 1000);
+        assert_eq!(calls[0], (0..500).collect::<Vec<_>>());
+        assert_eq!(calls[1], (500..1000).collect::<Vec<_>>());
+        let mut replay = vec![];
+        delete_cache_chunks((0..1501).map(Ok::<_, ()>), |keys| {
+            replay.extend(keys);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replay, (0..1501).collect::<Vec<_>>());
+    }
+    #[test]
+    fn malformed_key_or_empty_input_never_advances_later_work() {
+        let mut calls = 0;
+        assert!(delete_cache_chunks([Ok(1), Err("malformed"), Ok(2)], |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        delete_cache_chunks(std::iter::empty::<Result<u8, ()>>(), |_| {
+            panic!("empty cannot dispatch")
+        })
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod atomic_delete_tests {
     use super::*;

@@ -229,14 +229,13 @@ pub struct ChainQuery {
 pub enum Operation {
     AddBlocks,
     DeleteBlocks,
-    DeleteBlocksWithHistory(crossbeam_channel::Sender<[u8; 32]>),
 }
 
 impl std::fmt::Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Operation::AddBlocks => "Adding",
-            Operation::DeleteBlocks | Operation::DeleteBlocksWithHistory(_) => "Deleting",
+            Operation::DeleteBlocks => "Deleting",
         })
     }
 }
@@ -309,30 +308,12 @@ impl Indexer {
                 reorged.len()
             );
         }
-        // This channel holds a Vec of [u8; 32] scripts found in the blocks (with duplicates)
-        // if we reorg the whole mainnet chain it should come out to about 145 GB of memory.
-        let (tx, rx) = crossbeam_channel::unbounded();
-        // Delete history_db
+        // Each history batch invalidates its exact affected caches before
+        // deleting dependent rows. No reorg-wide script queue/set is retained.
         bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
-            .map(|blocks| self.index(&blocks, Operation::DeleteBlocksWithHistory(tx.clone())))?;
-        // Delete txstore
+            .map(|blocks| self.index(&blocks, Operation::DeleteBlocks))?;
         bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
             .map(|blocks| self.add(&blocks, Operation::DeleteBlocks))?;
-        // All senders must be dropped for receiver iterator to finish
-        drop(tx);
-
-        // All senders are dropped by now, so the receiver will iterate until the
-        // end of the unbounded queue.
-        let scripts = rx.into_iter().collect::<HashSet<_>>();
-        for script in scripts {
-            // cancel the script cache DB for these scripts. They might get incorrect data mixed in.
-            self.store.cache_db.delete(vec![
-                StatsCacheRow::key(&script),
-                UtxoCacheRow::key(&script),
-                #[cfg(feature = "liquid")]
-                [b"z", &script[..]].concat(), // asset cache key
-            ])?;
-        }
         Ok(())
     }
 
@@ -582,6 +563,17 @@ impl Indexer {
         if let Operation::AddBlocks = op {
             self.store.history_db.write(rows, self.flush);
         } else {
+            // Canonical H (script) and Liquid I (asset) row prefixes contain
+            // exactly the hashes previously emitted by indexing callbacks.
+            // Invalidate BEFORE history deletion so an error retains the data
+            // needed to replay the same cache keys on the sole writer.
+            let keys = rows.iter().flat_map(|row| {
+                match super::db::history_cache_keys(&row.key, cfg!(feature = "liquid")) {
+                    Ok(keys) => keys.into_iter().map(Ok).collect::<Vec<_>>(),
+                    Err(error) => vec![Err(Error::from(error))],
+                }
+            });
+            super::db::delete_cache_chunks(keys, |keys| self.store.cache_db.delete(keys))?;
             self.store
                 .history_db
                 .delete(rows.into_iter().map(|r| r.key).collect())?;
@@ -1946,7 +1938,7 @@ fn index_transaction(
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
-    op: &Operation,
+    _op: &Operation,
 ) {
     // persist history index:
     //      H{funding-scripthash}{spending-height}{spending-block-pos}S{spending-txid:vin}{funding-txid:vout} → ""
@@ -1954,11 +1946,6 @@ fn index_transaction(
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
     let txid = full_hash(&tx.txid()[..]);
-    let script_callback = |script_hash| {
-        if let Operation::DeleteBlocksWithHistory(tx) = op {
-            tx.send(script_hash).expect("unbounded channel won't fail");
-        }
-    };
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) || iconfig.index_unspendables {
             let history = TxHistoryRow::new(
@@ -1971,7 +1958,6 @@ fn index_transaction(
                     value: txo.value,
                 }),
             );
-            script_callback(history.key.hash);
             rows.push(history.into_row());
 
             if iconfig.address_search {
@@ -2001,7 +1987,6 @@ fn index_transaction(
                 value: prev_txo.value,
             }),
         );
-        script_callback(history.key.hash);
         rows.push(history.into_row());
 
         let edge = TxEdgeRow::new(
@@ -2022,7 +2007,7 @@ fn index_transaction(
         iconfig.network,
         iconfig.parent_network,
         rows,
-        op,
+        _op,
     );
 }
 
@@ -2733,5 +2718,45 @@ mod tests {
                 0, 0, 5, 57
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_invalidation_layout_tests {
+    use super::*;
+    #[test]
+    fn actual_history_serialization_matches_old_script_and_asset_callback_keys() {
+        #[cfg(feature = "liquid")]
+        let value = Value::Explicit(1);
+        #[cfg(not(feature = "liquid"))]
+        let value = 1;
+        for code in [b'H', b'I'] {
+            let row = TxHistoryRow {
+                key: TxHistoryKey {
+                    code,
+                    hash: [7; 32],
+                    confirmed_height: 42,
+                    tx_position: 3,
+                    txinfo: TxHistoryInfo::Funding(FundingInfo {
+                        txid: [9; 32],
+                        vout: 2,
+                        value,
+                    }),
+                },
+            }
+            .into_row();
+            assert_eq!(row.key[0], code);
+            assert_eq!(&row.key[1..33], &[7; 32]);
+            let keys =
+                super::super::db::history_cache_keys(&row.key, cfg!(feature = "liquid")).unwrap();
+            if code == b'I' && !cfg!(feature = "liquid") {
+                assert!(keys.is_empty());
+                continue;
+            }
+            assert_eq!(keys[0], StatsCacheRow::key(&[7; 32]));
+            assert_eq!(keys[1], UtxoCacheRow::key(&[7; 32]));
+            #[cfg(feature = "liquid")]
+            assert_eq!(keys[2], [b"z", &[7; 32][..]].concat());
+        }
     }
 }
