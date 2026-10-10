@@ -12,6 +12,23 @@ storage = importlib.util.module_from_spec(spec); spec.loader.exec_module(storage
 
 
 class StorageTests(unittest.TestCase):
+    def test_exact_fuse2fs_metadata_paths_and_no_execution(self):
+        self.assertEqual(storage.FUSE2FS_TOOLS, ['/usr/bin/fuse2fs', '/usr/sbin/fuse2fs'])
+        source = (HERE / 'storage-enforcement-metadata.py').read_text()
+        self.assertIn('toolExecutionObserved\': False', source)
+        self.assertNotIn('[\'fuse2fs\',', source)
+
+    def test_unknown_fuse_reference_rejected_before_read(self):
+        with patch.object(pathlib.Path, 'read_bytes', side_effect=AssertionError('no read')):
+            with self.assertRaisesRegex(ValueError, 'reviewed FUSE reference'):
+                storage.fuse_reference_metadata('/home/github-runner/.cargo/credentials')
+
+    def test_missing_fuse_library_stays_availability_only(self):
+        with patch.object(pathlib.Path, 'exists', return_value=False):
+            result = storage.fuse_reference_metadata('/usr/lib/x86_64-linux-gnu/libfuse.so.2')
+        self.assertFalse(result['present'])
+        self.assertNotIn('mountSupported', result)
+
     def test_default_no_metadata_or_action(self):
         result = subprocess.run(['python', '-B', '-I', '-S', str(HERE / 'storage-enforcement-metadata.py')], check=True, capture_output=True)
         self.assertEqual(json.loads(result.stdout), {'preparedOnly': True, 'metadataRead': False, 'mounted': False})

@@ -16,6 +16,9 @@ SAFE_OPTIONS = {'rw', 'ro', 'nosuid', 'nodev', 'noexec', 'relatime', 'noatime', 
 TOOLS = ['/usr/bin/fusermount3', '/usr/bin/fusermount', '/usr/bin/mount', '/usr/bin/umount',
          '/usr/sbin/losetup', '/usr/sbin/mke2fs', '/usr/sbin/setquota', '/usr/sbin/xfs_quota',
          '/usr/bin/btrfs', '/usr/bin/sudo']
+FUSE2FS_TOOLS = ['/usr/bin/fuse2fs', '/usr/sbin/fuse2fs']
+FUSE_REFERENCES = ['/usr/include/fuse3/fuse.h', '/usr/include/fuse/fuse.h', '/usr/include/fuse.h',
+                   '/usr/lib/x86_64-linux-gnu/libfuse.so.2', '/usr/lib/x86_64-linux-gnu/libfuse3.so.3']
 
 
 def wrapper():
@@ -119,6 +122,17 @@ def fuse_metadata():
             'opened': False, 'mountQualified': False}
 
 
+def fuse_reference_metadata(name):
+    if name not in FUSE_REFERENCES: raise ValueError('exact reviewed FUSE reference only')
+    path = pathlib.Path(name)
+    if not path.exists(): return {'requestedPath': name, 'present': False}
+    resolved = path.resolve(strict=True)
+    if not str(resolved).startswith(('/usr/include/', '/usr/lib/x86_64-linux-gnu/')) or not resolved.is_file() or resolved.stat().st_size > 32 * 1024**2:
+        raise ValueError('known FUSE header/library type/path/size required')
+    return {'requestedPath': name, 'path': str(resolved), 'present': True, 'bytes': resolved.stat().st_size,
+            'sha256': hashlib.sha256(resolved.read_bytes()).hexdigest(), 'readOnlyObserved': True}
+
+
 def collect():
     guard = wrapper(); expected = guard.runtime_guard()
     inventory = guard.load_source('owned_storage_source_guard', HERE / 'locked-source-inventory.py')
@@ -134,6 +148,10 @@ def collect():
               'freeTemporaryBytes': resources['freeTempBytes'], 'effectiveSelfCapabilities': caps,
               'availableMemoryKiB': resources['memoryKiB']['MemAvailable'],
               'fuse': fuse_metadata(), 'tools': tools, 'sudoPolicySummary': sudo_metadata(tools),
+              'existingFuse2fs': [tool_metadata(name) for name in FUSE2FS_TOOLS],
+              'knownFuseHeadersAndLibraries': [fuse_reference_metadata(name) for name in FUSE_REFERENCES],
+              'fixedSizeExt4FuseCandidate': {'toolExecutionObserved': False, 'mountSupported': False,
+                                            'smallImageProofExecuted': False, 'aggregateCeilingEnforced': False},
               'aggregate8GiBEnforcementQualified': False, 'capabilityProofExecuted': False,
               'storageCreated': False, 'deviceOpened': False, 'mounted': False, 'quotaChanged': False,
               'unitsCreated': False, 'cargoInvoked': False, 'installed': False, 'nativeActions': False,
