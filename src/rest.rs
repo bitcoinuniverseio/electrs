@@ -672,7 +672,7 @@ async fn run_server(
         let metric = metric.clone();
 
         async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
+            Ok::<_, hyper::Error>(service_fn(move |req: hyper::Request<Body>| {
                 let query = Arc::clone(&query);
                 let config = Arc::clone(&config);
                 let timer = metric.with_label_values(&["all_methods"]).start_timer();
