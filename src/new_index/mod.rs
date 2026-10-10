@@ -1,5 +1,7 @@
 pub mod db;
 mod fetch;
+#[cfg(not(feature = "liquid"))]
+pub mod history_coverage;
 mod mempool;
 #[cfg(not(feature = "liquid"))]
 pub mod page_http;
@@ -7,6 +9,7 @@ pub mod page_http;
 pub mod paged_outputs;
 pub mod precache;
 pub mod qualification;
+pub mod qualified_edges;
 mod query;
 #[cfg(not(feature = "liquid"))]
 pub mod read_context;

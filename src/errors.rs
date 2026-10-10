@@ -15,6 +15,11 @@ error_chain! {
             display("Iterrupted by signal {}", sig)
         }
 
+        LegacyPositionUnavailable {
+            description("Confirmed funding/spending position proof unavailable")
+            display("Confirmed funding/spending position proof unavailable")
+        }
+
         TooManyUtxos(limit: usize) {
             description("Too many unspent transaction outputs. Contact support to raise limits.")
             display("Too many unspent transaction outputs (>{}). Contact support to raise limits.", limit)

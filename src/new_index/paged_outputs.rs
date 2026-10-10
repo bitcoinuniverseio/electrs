@@ -49,6 +49,7 @@ pub struct Funding {
 #[serde(deny_unknown_fields)]
 pub struct Pending {
     pub funding: Funding,
+    pub funding_position: u16,
     pub funding_key: Vec<u8>,
     pub confirmation_key: Option<Vec<u8>>,
     pub confirmation_seen: bool,
@@ -57,6 +58,8 @@ pub struct Pending {
     pub block_hash: Option<String>,
     pub spend_key: Option<Vec<u8>>,
     pub spend_txid: Option<Txid>,
+    pub spend_block: Option<BlockId>,
+    pub spend_position: Option<u16>,
     pub spend_confirmation_key: Option<Vec<u8>>,
     pub spend_confirmation_seen: bool,
     pub emitted: bool,
@@ -99,6 +102,7 @@ pub struct OutputPage {
 pub struct HistoryRecord {
     pub key: Vec<u8>,
     pub funding: Option<Funding>,
+    pub position: u16,
 }
 pub struct ConfirmationRecord {
     pub key: Vec<u8>,
@@ -107,6 +111,8 @@ pub struct ConfirmationRecord {
 pub struct SpendRecord {
     pub key: Vec<u8>,
     pub txid: Txid,
+    pub canonical: Option<BlockId>,
+    pub position: u16,
 }
 pub struct MempoolRecord {
     pub funding: Option<Funding>,
@@ -114,7 +120,19 @@ pub struct MempoolRecord {
 }
 /// All next-record methods perform one error-preserving exact-key seek/visit.
 /// Snapshot implementations must not call legacy whole-vector/hidden-loop helpers.
+#[derive(Clone, Copy)]
+pub enum ReadOperation {
+    History,
+    Confirmation,
+    Spend,
+    MempoolSpend,
+    Mempool,
+}
 pub trait PageSource {
+    /// Reserve all maximum nested point reads before dispatching a source call.
+    fn operation_work(&self, _operation: ReadOperation) -> usize {
+        1
+    }
     fn valid(&self, scope: &ReadScope) -> Result<(), PageError>;
     fn history(&self, after: Option<&[u8]>) -> Result<Option<HistoryRecord>, PageError>;
     fn confirmation(
@@ -135,14 +153,22 @@ struct Budget {
     deadline: Instant,
 }
 impl Budget {
+    #[cfg(test)]
     fn charge(&mut self) -> Result<bool, PageError> {
+        self.charge_units(1)
+    }
+    fn charge_units(&mut self, units: usize) -> Result<bool, PageError> {
         if Instant::now() >= self.deadline {
             return Err(PageError::Deadline);
         }
-        if self.used == WORK_LIMIT {
+        if units == 0 || units > WORK_LIMIT {
+            return Err(PageError::Contract);
+        }
+        let next = self.used.checked_add(units).ok_or(PageError::Capacity)?;
+        if next > WORK_LIMIT {
             return Ok(false);
         }
-        self.used += 1;
+        self.used = next;
         Ok(true)
     }
 }
@@ -241,6 +267,14 @@ impl PageCursor {
                 || p.spend_confirmation_seen != p.spend_confirmation_key.is_some()
                 || (p.spend_txid.is_none() && p.spend_confirmation_key.is_some())
                 || (p.spend_txid.is_some() && p.spend_key.is_none())
+                || (p.spend_txid.is_some() != p.spend_block.is_some())
+                || (p.spend_txid.is_some() != p.spend_position.is_some())
+                || p.spend_block.as_ref().map_or(false, |block| {
+                    block.height as u64 > self.scope.height as u64
+                        || !(block.height > p.funding.height as usize
+                            || (block.height == p.funding.height as usize
+                                && p.spend_position.unwrap_or(0) > p.funding_position))
+                })
                 || p.block_hash
                     .as_ref()
                     .map_or(false, |hash| !lower_hex(hash, 64) || !p.confirmation_seen)
@@ -322,7 +356,7 @@ pub(crate) fn read_page_until(
                 vout: p.funding.vout,
             };
             if !p.funding_confirmation_complete {
-                if !budget.charge()? {
+                if !budget.charge_units(source.operation_work(ReadOperation::Confirmation))? {
                     state.pending = Some(p);
                     break;
                 }
@@ -367,7 +401,7 @@ pub(crate) fn read_page_until(
                 continue;
             }
             if let Some(txid) = p.spend_txid {
-                if !budget.charge()? {
+                if !budget.charge_units(source.operation_work(ReadOperation::Confirmation))? {
                     state.pending = Some(p);
                     break;
                 }
@@ -379,40 +413,57 @@ pub(crate) fn read_page_until(
                             if block.height as u64 > state.scope.height as u64 {
                                 return Err(PageError::Contract);
                             }
-                            // A spend of a previous identical-txid incarnation
-                            // cannot consume a later funding incarnation.
-                            if block.height as u32 >= p.funding.height {
+                            // Only this edge's actual containing block may
+                            // prove a spend. Another txid incarnation is not
+                            // interchangeable, even when it is canonical.
+                            if p.spend_block.as_ref().map_or(false, |expected| {
+                                expected.hash == block.hash && expected.height == block.height
+                            }) {
                                 state.last_history_key = Some(p.funding_key);
                                 continue;
                             }
                         }
                     }
-                    None => {
-                        if !p.spend_confirmation_seen {
-                            return Err(PageError::Unavailable);
-                        }
-                        p.spend_txid = None;
-                        p.spend_confirmation_key = None;
-                        p.spend_confirmation_seen = false;
-                    }
+                    None => return Err(PageError::Unavailable),
                 }
                 state.pending = Some(p);
                 continue;
             }
             if !p.emitted {
-                if !budget.charge()? {
+                if !budget.charge_units(source.operation_work(ReadOperation::Spend))? {
                     state.pending = Some(p);
                     break;
                 }
                 match source.spend(&point, p.spend_key.as_deref())? {
                     Some(row) => {
                         p.spend_key = Some(row.key);
+                        let block = match row.canonical {
+                            Some(block) => block,
+                            None => {
+                                state.pending = Some(p);
+                                continue;
+                            }
+                        };
+                        if block.height as u64 > state.scope.height as u64 {
+                            return Err(PageError::Contract);
+                        }
+                        if !(block.height > p.funding.height as usize
+                            || (block.height == p.funding.height as usize
+                                && row.position > p.funding_position))
+                        {
+                            state.pending = Some(p);
+                            continue;
+                        }
+                        p.spend_block = Some(block);
+                        p.spend_position = Some(row.position);
                         p.spend_txid = Some(row.txid);
                         state.pending = Some(p);
                         continue;
                     }
                     None => {
-                        if !budget.charge()? {
+                        if !budget
+                            .charge_units(source.operation_work(ReadOperation::MempoolSpend))?
+                        {
                             state.pending = Some(p);
                             break;
                         }
@@ -438,7 +489,7 @@ pub(crate) fn read_page_until(
             }
             state.last_history_key = Some(p.funding_key);
         } else if !state.history_complete {
-            if !budget.charge()? {
+            if !budget.charge_units(source.operation_work(ReadOperation::History))? {
                 break;
             }
             match source.history(state.last_history_key.as_deref())? {
@@ -446,6 +497,7 @@ pub(crate) fn read_page_until(
                     if let Some(funding) = row.funding {
                         state.pending = Some(Pending {
                             funding,
+                            funding_position: row.position,
                             funding_key: row.key,
                             confirmation_key: None,
                             confirmation_seen: false,
@@ -454,6 +506,8 @@ pub(crate) fn read_page_until(
                             block_hash: None,
                             spend_key: None,
                             spend_txid: None,
+                            spend_block: None,
+                            spend_position: None,
                             spend_confirmation_key: None,
                             spend_confirmation_seen: false,
                             emitted: false,
@@ -465,7 +519,7 @@ pub(crate) fn read_page_until(
                 None => state.history_complete = true,
             }
         } else {
-            if !budget.charge()? {
+            if !budget.charge_units(source.operation_work(ReadOperation::Mempool))? {
                 break;
             }
             match source.mempool(state.mempool_offset)? {
@@ -621,6 +675,7 @@ mod tests {
                 Some(HistoryRecord {
                     key: key(i),
                     funding: Some(funding(i)),
+                    position: 0,
                 })
             } else {
                 None
@@ -756,6 +811,9 @@ mod tests {
     struct Incarnations {
         confirmations: Vec<Option<BlockId>>,
         spending: Vec<Option<BlockId>>,
+        funding_position: u16,
+        spending_position: u16,
+        edge_block: Option<BlockId>,
         visits: Cell<usize>,
         changed: Option<usize>,
     }
@@ -785,6 +843,7 @@ mod tests {
                 Some(HistoryRecord {
                     key: key(index),
                     funding: Some(f),
+                    position: self.funding_position,
                 })
             } else {
                 None
@@ -817,6 +876,14 @@ mod tests {
                 Some(SpendRecord {
                     key: key(0),
                     txid: funding(999).txid,
+                    canonical: self.edge_block.clone().or_else(|| {
+                        self.spending
+                            .iter()
+                            .flatten()
+                            .max_by_key(|block| block.height)
+                            .cloned()
+                    }),
+                    position: self.spending_position,
                 })
             } else {
                 None
@@ -838,6 +905,9 @@ mod tests {
         Incarnations {
             confirmations,
             spending,
+            funding_position: 0,
+            spending_position: 1,
+            edge_block: None,
             visits: Cell::new(0),
             changed: None,
         }
@@ -865,6 +935,27 @@ mod tests {
         assert!(cursor.complete);
         assert!(page.items.is_empty());
     }
+    #[test]
+    fn same_block_spend_requires_strictly_later_transaction_position() {
+        for position in [3, 4, 5] {
+            let mut source = incarnations(vec![Some(block(90, 2))], vec![Some(block(90, 2))]);
+            source.funding_position = 4;
+            source.spending_position = position;
+            let (page, cursor) = read_page(&source, &PageCursor::initial(scope())).unwrap();
+            assert!(cursor.complete);
+            assert_eq!(page.items.len(), if position > 4 { 0 } else { 1 });
+        }
+    }
+    #[test]
+    fn different_canonical_txid_incarnation_cannot_prove_this_edge() {
+        let mut source = incarnations(vec![Some(block(90, 2))], vec![Some(block(95, 5))]);
+        source.edge_block = Some(block(95, 4));
+        assert!(matches!(
+            read_page(&source, &PageCursor::initial(scope())),
+            Err(PageError::Unavailable)
+        ));
+    }
+
     #[test]
     fn same_height_conflicting_current_confirmation_is_contract_error() {
         let source = incarnations(vec![Some(block(90, 2)), Some(block(90, 3))], vec![]);
@@ -910,6 +1001,19 @@ mod tests {
             read_page(&source, &PageCursor::initial(scope())),
             Err(PageError::Changed)
         ));
+    }
+    #[test]
+    fn nested_read_reservation_never_dispatches_past500_boundary() {
+        let mut budget = Budget {
+            used: 498,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert!(!budget.charge_units(3).unwrap());
+        assert_eq!(budget.used, 498);
+        assert!(budget.charge_units(2).unwrap());
+        assert_eq!(budget.used, 500);
+        assert!(!budget.charge_units(1).unwrap());
+        assert_eq!(budget.used, 500);
     }
     #[test]
     fn logical_deadline_exhaustion_does_not_charge_more_io_work() {

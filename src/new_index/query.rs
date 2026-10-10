@@ -50,6 +50,9 @@ struct PagedQuerySnapshot<'a> {
 }
 #[cfg(not(feature = "liquid"))]
 impl super::paged_outputs::PageSource for PagedQuerySnapshot<'_> {
+    fn operation_work(&self, operation: super::paged_outputs::ReadOperation) -> usize {
+        self.chain.operation_work(operation)
+    }
     fn valid(
         &self,
         scope: &super::paged_outputs::ReadScope,
@@ -241,20 +244,25 @@ impl Query {
             .clone();
         // Binding hashes static read-affecting configuration, excluding cookie
         // and credentials. It is a profile binding, not a source observation.
-        let profile = serde_json::to_vec(&(
-            network,
-            self.config.magic,
-            self.config.db_path.to_string_lossy(),
-            self.config.daemon_rpc_addr.to_string(),
-            self.config.light_mode,
-            self.config.index_unspendables,
-            super::db::DB_VERSION,
-            crate::config::ELECTRS_VERSION,
-            cfg!(feature = "electrum-discovery"),
-            bootstrap.signet_challenge_sha256.as_ref(),
-            super::paged_outputs::WORK_LIMIT,
-            super::paged_outputs::BODY_LIMIT,
-        ))
+        let profile = super::read_context::StaticReadProfile {
+            network: network.into(),
+            magic: self.config.magic,
+            db_path: self.config.db_path.to_string_lossy().into_owned(),
+            rpc_address: self.config.daemon_rpc_addr.to_string(),
+            light_mode: self.config.light_mode,
+            index_unspendables: self.config.index_unspendables,
+            db_version: super::db::DB_VERSION,
+            electrs_version: crate::config::ELECTRS_VERSION.into(),
+            electrum_discovery: cfg!(feature = "electrum-discovery"),
+            work_limit: super::paged_outputs::WORK_LIMIT,
+            body_limit: super::paged_outputs::BODY_LIMIT,
+            history_proof_dir: self
+                .config
+                .history_proof_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        }
+        .bytes(&bootstrap)
         .map_err(|_| PageError::Contract)?;
         let hex = |bytes: &[u8]| {
             bytes
@@ -375,11 +383,11 @@ impl Query {
         confirmed_txids.chain(mempool_txids).collect()
     }
 
-    pub fn stats(&self, scripthash: &[u8]) -> (ScriptStats, ScriptStats) {
-        (
-            self.chain.stats(scripthash, super::db::DBFlush::Enable),
+    pub fn stats(&self, scripthash: &[u8]) -> Result<(ScriptStats, ScriptStats)> {
+        Ok((
+            self.chain.stats(scripthash, super::db::DBFlush::Enable)?,
             self.mempool().stats(scripthash),
-        )
+        ))
     }
 
     pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
@@ -399,26 +407,40 @@ impl Query {
         self.mempool().lookup_txos(outpoints)
     }
 
-    pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
-        self.chain
-            .lookup_spend(outpoint)
-            .or_else(|| self.mempool().lookup_spend(outpoint))
+    pub fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingInput>> {
+        Ok(self
+            .chain
+            .lookup_spend(outpoint)?
+            .or_else(|| self.mempool().lookup_spend(outpoint)))
     }
 
-    pub fn lookup_tx_spends(&self, tx: Transaction) -> Vec<Option<SpendingInput>> {
+    pub fn lookup_tx_spends(&self, tx: Transaction) -> Result<Vec<Option<SpendingInput>>> {
         let txid = tx.txid();
+        #[cfg(not(feature = "liquid"))]
+        let budget = super::qualified_edges::ReadBudget::new();
 
         tx.output
             .par_iter()
             .enumerate()
             .map(|(vout, txout)| {
                 if is_spendable(txout) {
-                    self.lookup_spend(&OutPoint {
+                    let outpoint = OutPoint {
                         txid,
                         vout: vout as u32,
-                    })
+                    };
+                    #[cfg(feature = "liquid")]
+                    {
+                        self.lookup_spend(&outpoint)
+                    }
+                    #[cfg(not(feature = "liquid"))]
+                    {
+                        Ok(self
+                            .chain
+                            .lookup_spend_with_budget(&outpoint, &budget)?
+                            .or_else(|| self.mempool().lookup_spend(&outpoint)))
+                    }
                 } else {
-                    None
+                    Ok(None)
                 }
             })
             .collect()
