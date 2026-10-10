@@ -196,6 +196,42 @@ jobs:
           EOF
           UNIT="universe-electrs-cargo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           trap '/usr/bin/systemctl --user stop "$UNIT.service" >/dev/null 2>&1 || true' EXIT
+          export LIBCLANG CARGO_HOME
+          /usr/bin/python3.12 -B -I -S - <<'PY'
+          import hashlib,json,os,pathlib,stat
+          lib=(pathlib.Path(os.environ['LIBCLANG'])/'libclang-18.so.18').resolve(strict=True)
+          if not lib.is_file():raise SystemExit('Clang18 shared library is unavailable')
+          expected_lib_sha='d7c54213dbeb95deb5bfee76cf3e32e425cbaf8ccbd2900345414fb57476458b'
+          with lib.open('rb') as stream:lib_sha=hashlib.file_digest(stream,'sha256').hexdigest()
+          if lib_sha!=expected_lib_sha:raise SystemExit('Clang18 library differs from recorded tool; no header substitution')
+          allowed=[pathlib.Path('/usr/lib/llvm-18/lib/clang/18'),
+                   pathlib.Path('/home/github-runner/.local/universe-host-tools/prefix/usr/lib/llvm-18/lib/clang/18')]
+          derived=lib.parent/'clang/18'
+          ordered=([derived] if derived in allowed else [])+[p for p in allowed if p!=derived]
+          observations=[];selected=None
+          for resource in ordered:
+              header=resource/'include/stdbool.h'
+              try:
+                  resolved_root=resource.resolve(strict=True);resolved_header=header.resolve(strict=True);info=resolved_header.lstat()
+                  if resolved_header.parent!=(resolved_root/'include').resolve(strict=True) or not stat.S_ISREG(info.st_mode) or not 0<info.st_size<=1048576:
+                      raise ValueError('header not bounded regular member of exact resource tree')
+                  with resolved_header.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
+                  observations.append({'resourceDir':str(resource),'resolvedResourceDir':str(resolved_root),'header':str(resolved_header),'bytes':info.st_size,'sha256':digest,'readable':True})
+                  if selected is None:selected=resource
+              except (FileNotFoundError,PermissionError,ValueError) as error:
+                  observations.append({'resourceDir':str(resource),'header':'include/stdbool.h','readable':False,'failureType':type(error).__name__})
+          print(json.dumps({'libclang':str(lib),'libclangSha256':lib_sha,'existingHeaderCandidates':observations,'installed':False}))
+          if selected is None:
+              raise SystemExit('Existing Clang18 stdbool.h unavailable in checked system/prefix resource directories; stop without installation')
+          args='-resource-dir='+str(selected)
+          env_file=pathlib.Path(os.environ['CARGO_HOME'])/'bindgen-resource.env'
+          with env_file.open('x') as stream:
+              stream.write('BINDGEN_RESOURCE_DIR='+str(selected)+'\n')
+              stream.write('BINDGEN_RESOURCE_HEADER_SHA256='+next(r['sha256'] for r in observations if r['resourceDir']==str(selected) and r['readable'])+'\n')
+              stream.write('BINDGEN_EXTRA_CLANG_ARGS='+args+'\n')
+          PY
+          # Only fixed allowlisted ASCII paths and hex hashes are emitted above.
+          source "$CARGO_HOME/bindgen-resource.env"
           /usr/bin/systemd-run --user --unit="$UNIT" --wait --collect --pipe --service-type=exec \
             --property=CPUQuota=200% --property=MemoryMax=4G --property=TasksMax=128 \
             --property=RuntimeMaxSec=1800s --property=TimeoutStopSec=5s --property=KillMode=control-group \
@@ -203,13 +239,14 @@ jobs:
             /usr/bin/env -i LANG=C HOME="$CARGO_HOME/home" \
             PATH="$RUST/bin:/usr/bin:/bin" RUSTC="$RUST/bin/rustc" CC="$CC" CXX="$CXX" \
             AR=/usr/bin/x86_64-linux-gnu-ar LIBCLANG_PATH="$LIBCLANG" \
+            BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_EXTRA_CLANG_ARGS" \
             CARGO_HOME="$CARGO_HOME" CARGO_TARGET_DIR="$TASK/target" TMPDIR="$CARGO_HOME/tmp" \
             GIT_HASH="$EXPECTED_SHA" ELECTRS_SOURCE_REVISION="$EXPECTED_SHA" \
             "$CARGO" build --release --bin electrs --offline --frozen --jobs 2 --manifest-path "$SOURCE/Cargo.toml"
           sha256sum "$TASK/target/release/electrs"
           stat -c 'binary bytes=%s' "$TASK/target/release/electrs"
           du -sb "$TASK/target"
-          export RUST CC CXX LIBCLANG
+          export RUST CC CXX LIBCLANG BINDGEN_RESOURCE_DIR BINDGEN_RESOURCE_HEADER_SHA256
           /usr/bin/python3.12 -B -I -S - <<'PY'
           import datetime,hashlib,json,os,pathlib,shutil,subprocess,tomllib
           task=pathlib.Path(os.environ['TASK']);source=pathlib.Path(os.environ['SOURCE']);sha=os.environ['EXPECTED_SHA']
@@ -234,6 +271,7 @@ jobs:
               if not resolved.is_file():raise SystemExit('actual tool metadata unavailable')
               tools[role]={'requestedPath':str(path),'resolvedPath':str(resolved),'sha256':digest(resolved),'version':metadata([str(resolved),'-Vv' if role=='rustc' else '--version'])}
           clang=(pathlib.Path(os.environ['LIBCLANG'])/'libclang-18.so.18').resolve(strict=True)
+          tools['bindgenResource']={'resourceDir':os.environ['BINDGEN_RESOURCE_DIR'],'stdboolHeaderSha256':os.environ['BINDGEN_RESOURCE_HEADER_SHA256']}
           tools['libclang']={'resolvedPath':str(clang),'sha256':digest(clang),'versionRecordedByLibraryIdentityNotCLI':True}
           linkage=metadata(['/usr/bin/ldd',str(output)])
           app=tomllib.loads((source/'Cargo.toml').read_text())
