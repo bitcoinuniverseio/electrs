@@ -1,3 +1,4 @@
+use super::read_generation::MempoolPublication;
 use bounded_vec_deque::BoundedVecDeque;
 use itertools::Itertools;
 
@@ -31,6 +32,9 @@ pub struct Mempool {
     chain: Arc<ChainQuery>,
     config: Arc<Config>,
     txstore: BTreeMap<Txid, Transaction>,
+    // Only the new pager consumes publication; legacy producer behavior is unchanged.
+    read_publication: MempoolPublication,
+    fully_indexed: HashSet<Txid>,
     feeinfo: HashMap<Txid, TxFeeInfo>,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
@@ -64,6 +68,8 @@ impl Mempool {
         Mempool {
             chain,
             txstore: BTreeMap::new(),
+            read_publication: MempoolPublication::default(),
+            fully_indexed: HashSet::new(),
             feeinfo: HashMap::new(),
             history: HashMap::new(),
             edges: HashMap::new(),
@@ -390,14 +396,70 @@ impl Mempool {
         HashSet::from_iter(self.txstore.keys().cloned())
     }
 
+    fn invalidate_read_publication(&mut self) {
+        self.read_publication.invalidate();
+    }
+    pub fn paged_read_epoch(&self) -> Option<(u64, u64)> {
+        self.read_publication
+            .epoch(self.chain.completed_read_generation())
+    }
+    pub fn paged_has_spend(&self, outpoint: &OutPoint) -> bool {
+        self.edges.contains_key(outpoint)
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn paged_history_record(
+        &self,
+        hash: &[u8],
+        offset: usize,
+    ) -> Result<Option<super::paged_outputs::MempoolRecord>, super::paged_outputs::PageError> {
+        use super::paged_outputs::{Funding, MempoolRecord, PageError};
+        let info = match self
+            .history
+            .get(hash)
+            .and_then(|entries| entries.get(offset))
+        {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+        match info {
+            TxHistoryInfo::Spending(_) => Ok(Some(MempoolRecord {
+                funding: None,
+                spent: false,
+            })),
+            TxHistoryInfo::Funding(value) => {
+                let txid = bitcoin::consensus::encode::deserialize(&value.txid)
+                    .map_err(|_| PageError::Contract)?;
+                if !self.fully_indexed.contains(&txid) {
+                    return Err(PageError::Unavailable);
+                }
+                let point = OutPoint {
+                    txid,
+                    vout: value.vout,
+                };
+                Ok(Some(MempoolRecord {
+                    funding: Some(Funding {
+                        txid,
+                        vout: value.vout,
+                        value: value.value,
+                        height: 0,
+                    }),
+                    spent: self.edges.contains_key(&point),
+                }))
+            }
+        }
+    }
+
     pub fn update(mempool: &RwLock<Mempool>, daemon: &Daemon) -> Result<()> {
         // 1. Start the metrics timer and get the current mempool txids
         // [LOCK] Takes read lock for whole scope.
-        let (_timer, old_txids) = {
+        let (_timer, old_txids, chain_epoch, start_generation) = {
             let mempool = mempool.read().unwrap();
             (
                 mempool.latency.with_label_values(&["update"]).start_timer(),
                 mempool.unique_txids(),
+                mempool.chain.completed_read_generation(),
+                mempool.read_publication.token(),
             )
         };
 
@@ -405,6 +467,10 @@ impl Mempool {
         // [LOCK] No lock taken. Wait for RPC request. Get lists of remove/add txes.
         let all_txids = daemon
             .getmempooltxids()
+            .map_err(|error| {
+                mempool.write().unwrap().invalidate_read_publication();
+                error
+            })
             .chain_err(|| "failed to update mempool from daemon")?;
         let txids_to_remove: HashSet<&Txid> = old_txids.difference(&all_txids).collect();
         let txids_to_add: Vec<&Txid> = all_txids.difference(&old_txids).collect();
@@ -412,18 +478,28 @@ impl Mempool {
         // 3. Remove missing transactions. Even if we are unable to download new transactions from
         // the daemon, we still want to remove the transactions that are no longer in the mempool.
         // [LOCK] Write lock is released at the end of the call to remove().
-        mempool.write().unwrap().remove(txids_to_remove);
+        let (after_remove_generation, no_early_interleaving) = {
+            let mut current = mempool.write().unwrap();
+            let unchanged = current.read_publication.token() == start_generation;
+            current.remove(txids_to_remove);
+            (current.read_publication.token(), unchanged)
+        };
 
         // 4. Download the new transactions from the daemon's mempool
         // [LOCK] No lock taken, waiting for RPC response.
         let txs_to_add = daemon
             .gettransactions(&txids_to_add)
+            .map_err(|error| {
+                mempool.write().unwrap().invalidate_read_publication();
+                error
+            })
             .chain_err(|| format!("failed to get {} transactions", txids_to_add.len()))?;
 
         // 4. Update local mempool to match daemon's state
         // [LOCK] Takes Write lock for whole scope.
         {
             let mut mempool = mempool.write().unwrap();
+            let before_add_generation = mempool.read_publication.token();
             // Add new transactions
             if txs_to_add.len() > mempool.add(txs_to_add) {
                 debug!("Mempool update added less transactions than expected");
@@ -445,11 +521,26 @@ impl Mempool {
                 mempool.backlog_stats = (BacklogStats::new(&mempool.feeinfo), Instant::now());
             }
 
+            let complete = no_early_interleaving
+                && mempool.unique_txids() == all_txids
+                && mempool.fully_indexed == all_txids;
+            let chain_after = mempool.chain.completed_read_generation();
+            mempool.read_publication.finish_refresh(
+                after_remove_generation,
+                before_add_generation,
+                chain_epoch,
+                chain_after,
+                complete,
+            );
             Ok(())
         }
     }
 
     pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) -> Result<()> {
+        // Called after existing Core broadcast succeeds. Even a failed cache
+        // download is a known coverage gap: invalidate the new read publication,
+        // preserving the legacy return/error policy and its existing RPC count.
+        self.invalidate_read_publication();
         if !self.txstore.contains_key(txid) {
             if let Ok(tx) = daemon.getmempooltx(txid) {
                 if self.add(vec![tx]) == 0 {
@@ -478,6 +569,7 @@ impl Mempool {
         }
         debug!("Adding {} transactions to Mempool", txlen);
 
+        self.invalidate_read_publication();
         let mut txids = Vec::with_capacity(txs.len());
         // Phase 1: add to txstore
         for tx in txs {
@@ -530,6 +622,7 @@ impl Mempool {
             });
 
             self.feeinfo.insert(txid, feeinfo);
+            self.fully_indexed.insert(txid);
 
             // An iterator over (ScriptHash, TxHistoryInfo)
             let spending = prevouts.into_iter().map(|(input_index, prevout)| {
@@ -648,6 +741,12 @@ impl Mempool {
     }
 
     fn remove(&mut self, to_remove: HashSet<&Txid>) {
+        if !to_remove.is_empty() {
+            self.invalidate_read_publication();
+        }
+        for id in &to_remove {
+            self.fully_indexed.remove(*id);
+        }
         self.delta
             .with_label_values(&["remove"])
             .observe(to_remove.len() as f64);

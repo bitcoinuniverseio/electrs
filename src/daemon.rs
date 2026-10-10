@@ -316,6 +316,8 @@ pub struct Daemon {
     magic: Option<u32>,
     conn: Mutex<Connection>,
     message_id: Counter, // for monotonic JSONRPC 'id'
+    #[cfg(not(feature = "liquid"))]
+    bootstrap_observation: Option<crate::new_index::read_context::BootstrapObservation>,
     signal: Waiter,
 
     // monitoring
@@ -346,6 +348,8 @@ impl Daemon {
                 signal.clone(),
             )?),
             message_id: Counter::new(),
+            #[cfg(not(feature = "liquid"))]
+            bootstrap_observation: None,
             signal: signal.clone(),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("daemon_rpc", "Bitcoind RPC latency (in seconds)"),
@@ -356,6 +360,8 @@ impl Daemon {
                 &["method", "dir"],
             ),
         };
+        #[cfg(not(feature = "liquid"))]
+        let mut daemon = daemon;
         let network_info = daemon.getnetworkinfo()?;
         info!("{:?}", network_info);
         if network_info.version < 16_00_00 {
@@ -373,7 +379,31 @@ impl Daemon {
             bail!("pruned node is not supported (use '-prune=0' bitcoind flag)".to_owned())
         }
         loop {
-            let info = daemon.getblockchaininfo()?;
+            // Same existing RPC, no new bootstrap or per-page request.
+            let bootstrap_raw: Value = daemon.request("getblockchaininfo", json!([]))?;
+            #[cfg(not(feature = "liquid"))]
+            let bootstrap_candidate = {
+                // Timestamp this existing response capture, not the subsequent
+                // mempool request. Inspect bounded metadata by reference only.
+                let observed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|v| v.as_secs())
+                    .unwrap_or(0);
+                let name = match network {
+                    Network::Bitcoin => "mainnet",
+                    Network::Testnet => "testnet",
+                    Network::Testnet4 => "testnet4",
+                    Network::Signet => "signet",
+                    Network::Regtest => "regtest",
+                };
+                crate::new_index::read_context::BootstrapObservation::from_ready_response(
+                    name,
+                    &bootstrap_raw,
+                    observed,
+                )
+            };
+            let info: BlockchainInfo =
+                from_value(bootstrap_raw).chain_err(|| "invalid blockchain info")?;
             let mempool = daemon.getmempoolinfo()?;
 
             let ibd_done = if network.is_regtest() {
@@ -383,6 +413,10 @@ impl Daemon {
             };
 
             if mempool.loaded && ibd_done && info.blocks == info.headers {
+                #[cfg(not(feature = "liquid"))]
+                {
+                    daemon.bootstrap_observation = bootstrap_candidate;
+                }
                 break;
             }
 
@@ -406,10 +440,20 @@ impl Daemon {
             magic: self.magic,
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
             message_id: Counter::new(),
+            #[cfg(not(feature = "liquid"))]
+            // Inherited immutable bootstrap, never refreshed by reconnect.
+            bootstrap_observation: self.bootstrap_observation.clone(),
             signal: self.signal.clone(),
             latency: self.latency.clone(),
             size: self.size.clone(),
         })
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn paged_bootstrap_observation(
+        &self,
+    ) -> Option<&crate::new_index::read_context::BootstrapObservation> {
+        self.bootstrap_observation.as_ref()
     }
 
     pub fn list_blk_files(&self) -> Result<Vec<PathBuf>> {
