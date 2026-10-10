@@ -1,4 +1,4 @@
-name: Universe controlled confinement proof
+name: Universe exact locked cache inventory only
 
 on:
   workflow_dispatch:
@@ -19,6 +19,10 @@ on:
       - scripts/universe/confinement-proof.py
       - scripts/universe/confinement-build-child.py
       - scripts/universe/confinement-proof.test.py
+      - scripts/universe/locked-source-inventory.py
+      - scripts/universe/locked-source-inventory.test.py
+      - scripts/universe/locked-cache-readonly.py
+      - scripts/universe/locked-cache-readonly.test.py
 
 permissions:
   contents: read
@@ -39,10 +43,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Qualify one resource-capped owned tiny confinement control
+      - name: Observe exact locked source cache without Cargo or unit creation
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 -B -I -S scripts/universe/confinement-proof.py --run-proof
+          /usr/bin/python3.12 -B -I -S scripts/universe/locked-cache-readonly.py --observe-owned-cache
