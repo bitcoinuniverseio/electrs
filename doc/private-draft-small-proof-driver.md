@@ -1,4 +1,4 @@
-# Private draft transfer and ONE small proof — root dispatch pending
+# Private draft transfer and one small proof
 
 Root created release408752991/tagqualification-fuse-helper-20261010 on owned
 repository1412614956 (`bitcoinuniverseio/electrs`), draft=true and unpublished.
@@ -41,5 +41,13 @@ setuid mounting permitted, verifies actual guards, and tests the own fixed
 8MiB image/real aggregate ENOSPC/readback/settlement. No Cargo, native producer,
 host package install/settings change or8GiB/full-build qualification is done.
 Rust WIP is neither compiled nor labeled frozen. Default driver invocation
-performs no download or scope creation. The workflow/source is prepared locally;
-Root must independently review and push/dispatch. No execution occurred here.
+performs no download or scope creation.
+
+Run 38043284152 at source `11f27f090416fa674f9944e1b1f237811a421cba`
+failed resource pressure admission on 2026-10-10 before any transfer, mount or
+build. The original failure is preserved in the external audit receipt
+`electrs-small-proof-11f-actual-failure.json`. It does not qualify FUSE or Cargo.
+The revised driver removes its token from the environment before admission,
+and reports bounded memory, disk and pressure observations when admission fails.
+It preserves the admission limits, starts no transfer or scope on rejection,
+and omits original exception text. No retry has been performed for this failure.
