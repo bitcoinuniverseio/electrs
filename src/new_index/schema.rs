@@ -414,7 +414,7 @@ impl Indexer {
                     Network::Regtest => "regtest",
                 }
                 .into(),
-                magic: config.magic,
+                magic: config.magic.unwrap_or_else(|| config.network_type.magic()),
                 db_path: config.db_path.to_string_lossy().into_owned(),
                 rpc_address: config.daemon_rpc_addr.to_string(),
                 light_mode: config.light_mode,
