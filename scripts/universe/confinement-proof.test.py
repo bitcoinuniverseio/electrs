@@ -110,9 +110,10 @@ class ConfinementSourceTests(unittest.TestCase):
             value = self.report(); value['pressure']['io'] = raw
             with self.subTest(raw=raw), self.assertRaises(ValueError): p.headroom(value)
 
-    def test_current_workflow_runs_only_the_owned_capped_control(self):
+    def test_current_workflow_keeps_the_owned_gate_without_full_build(self):
         raw = (HERE.parents[1] / '.github/workflows/universe-native-preflight.yml').read_text()
-        self.assertIn('confinement-proof.py --run-proof', raw)
+        self.assertIn('locked-cache-readonly.py --observe-owned-cache', raw)
+        self.assertNotIn('confinement-proof.py --run-proof', raw)
         self.assertIn("github.repository == 'bitcoinuniverseio/electrs'", raw)
         self.assertIn('timeout-minutes: 5', raw)
         self.assertNotIn('cargo build', raw)
