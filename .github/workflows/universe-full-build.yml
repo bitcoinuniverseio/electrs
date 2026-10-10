@@ -1,0 +1,258 @@
+name: Owned full default Electrs build
+on:
+  workflow_dispatch:
+    inputs:
+      expected_source_sha:
+        required: true
+        type: string
+      draft_release_id:
+        required: true
+        type: string
+      vendor_asset_id:
+        required: true
+        type: string
+      cache_nonce:
+        description: Reviewed private task cache, exactly16 lowercase hex digits
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: owned-electrs-build-${{ inputs.cache_nonce }}
+  cancel-in-progress: false
+jobs:
+  full-default:
+    if: github.repository == 'bitcoinuniverseio/electrs' && github.ref == 'refs/heads/develop'
+    runs-on: [self-hosted, universe-runners-1]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Stage exact vendor and build full default binary
+        id: build
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_source_sha }}
+          RELEASE_ID: ${{ inputs.draft_release_id }}
+          ASSET_ID: ${{ inputs.vendor_asset_id }}
+          CACHE_NONCE: ${{ inputs.cache_nonce }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ && "$EXPECTED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$CACHE_NONCE" =~ ^[0-9a-f]{16}$ ]]
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]{0,18}$ && "$ASSET_ID" =~ ^[1-9][0-9]{0,18}$ ]]
+          [[ "$(id -u)" == 1001 && "$(id -g)" == 1001 ]]
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" && -z "$(git status --porcelain)" ]]
+          [[ "$(sha256sum Cargo.lock | cut -d' ' -f1)" == a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236 ]]
+          TASK="/home/github-runner/.cache/universe-electrs-api-20261009/$CACHE_NONCE"
+          export TASK
+          /usr/bin/python3.12 -B -I -S - <<'PY'
+          import os,pathlib,stat
+          task=pathlib.Path(os.environ['TASK'])
+          for p in [pathlib.Path('/'),pathlib.Path('/home'),pathlib.Path('/home/github-runner'),pathlib.Path('/home/github-runner/.cache')]:
+              s=p.lstat();expected=0 if str(p) in ['/', '/home'] else 1001
+              if not stat.S_ISDIR(s.st_mode) or p.is_symlink() or s.st_uid!=expected:raise SystemExit('cache ancestor ownership/link failure')
+          if not task.parent.exists():task.parent.mkdir(mode=0o700)
+          for p in [task.parent,task]:
+              if not p.exists():p.mkdir(mode=0o700)
+              s=p.lstat()
+              if not stat.S_ISDIR(s.st_mode) or p.is_symlink() or s.st_uid!=1001 or s.st_gid!=1001 or s.st_mode&0o077:raise SystemExit('private cache ownership failure')
+          PY
+          exec 9>"$TASK/build.lock"
+          /usr/bin/flock -n 9
+          RUST=/home/github-runner/.rustup/toolchains/1.89.0-x86_64-unknown-linux-gnu
+          CARGO="$RUST/bin/cargo"
+          CC=/usr/bin/x86_64-linux-gnu-gcc-13
+          CXX=/usr/bin/x86_64-linux-gnu-g++-13
+          LIBCLANG=/usr/lib/x86_64-linux-gnu
+          for p in "$CARGO" "$RUST/bin/rustc" "$CC" "$CXX" /usr/bin/x86_64-linux-gnu-ar /usr/bin/systemd-run /usr/bin/systemctl; do test -x "$p"; done
+          "$RUST/bin/rustc" -Vv
+          [[ "$(sha256sum "$RUST/bin/rustc" | cut -d' ' -f1)" == c6ac0142c05a60b0f6c15e1a118bd5ac3bd04924cd6dc0c328f501c5f86e4142 ]]
+          [[ "$(sha256sum "$CARGO" | cut -d' ' -f1)" == 5b32bd53b8a08d8e206daed51f3fce40cdc0729038ff96bd0ca845596a2c1019 ]]
+          [[ "$(sha256sum "$LIBCLANG/libclang-18.so.18" | cut -d' ' -f1)" == d7c54213dbeb95deb5bfee76cf3e32e425cbaf8ccbd2900345414fb57476458b ]]
+          [[ "$(df --output=avail -B1 "$TASK" | tail -1)" -ge 10737418240 ]]
+          [[ "$(awk '/MemAvailable:/{print $2}' /proc/meminfo)" -ge 5242880 ]]
+          /usr/bin/python3.12 -B -I -S - <<'PY'
+          import hashlib,json,os,pathlib,ssl,tarfile,urllib.request,urllib.error,urllib.parse
+          task=pathlib.Path(os.environ['TASK']);token=os.environ.pop('GITHUB_TOKEN');repo='/repos/bitcoinuniverseio/electrs'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args):return None
+          opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect(),urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          def metadata(path):
+              request=urllib.request.Request('https://api.github.com'+path,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'})
+              with opener.open(request,timeout=10) as response:raw=response.read(262145)
+              if len(raw)>262144:raise ValueError('metadata bound')
+              return json.loads(raw)
+          try:
+              release=metadata(repo+'/releases/'+os.environ['RELEASE_ID']);aid=int(os.environ['ASSET_ID'])
+              if release['id']!=int(os.environ['RELEASE_ID']) or not release['draft'] or release['published_at'] is not None:raise ValueError('owned unpublished draft required')
+              asset=next(a for a in release['assets'] if a['id']==aid)
+              if asset['name']!='electrs-final233-linux-vendor-a46b82fd.tar.gz' or asset['size']!=78799531:raise ValueError('exact asset metadata required')
+              destination=task/'final233.tar.gz';expected='948afa199b9fdaccc345c7fcccafad9278c3c31137a2ed6b88e4e7302dfbd2d9'
+              if destination.exists():
+                  with destination.open('rb') as s:actual=hashlib.file_digest(s,'sha256').hexdigest()
+                  if destination.is_symlink() or destination.stat().st_size!=78799531 or actual!=expected:raise ValueError('existing archive conflict')
+              else:
+                  request=urllib.request.Request('https://api.github.com'+repo+'/releases/assets/'+str(aid),headers={'Authorization':'Bearer '+token,'Accept':'application/octet-stream'})
+                  try:response=opener.open(request,timeout=10)
+                  except urllib.error.HTTPError as error:
+                      if error.code!=302:raise
+                      redirect=error.headers['Location'];parts=urllib.parse.urlsplit(redirect)
+                      if parts.scheme!='https' or parts.hostname!='release-assets.githubusercontent.com' or parts.username or parts.password:raise ValueError('asset redirect rejected')
+                      response=opener.open(urllib.request.Request(redirect),timeout=10) # No Authorization on redirected host.
+                  digest=hashlib.sha256();size=0
+                  with response,destination.open('xb') as output:
+                      while True:
+                          raw=response.read(65536)
+                          if not raw:break
+                          size+=len(raw)
+                          if size>78799531:raise ValueError('asset byte bound')
+                          digest.update(raw);output.write(raw)
+                  if size!=78799531 or digest.hexdigest()!=expected:raise ValueError('asset checksum mismatch')
+              token=None
+              if not (task/'vendor').exists():
+                  seen=set();total=0
+                  with tarfile.open(destination,'r|gz') as archive:
+                      for member in archive:
+                          path=pathlib.PurePosixPath(member.name)
+                          if not member.isfile() or member.name in seen or path.is_absolute() or '..' in path.parts or len(member.name)>512 or (path.parts[0]!='vendor' and member.name!='vendor-manifest.json'):raise ValueError('unsafe sealed member')
+                          seen.add(member.name);total+=member.size
+                          if len(seen)>18581 or total>1073741824 or member.size>33554432:raise ValueError('vendor size bound')
+                          output=task.joinpath(*path.parts);output.parent.mkdir(parents=True,exist_ok=True)
+                          with archive.extractfile(member) as source,output.open('xb') as sink:
+                              while True:
+                                  block=source.read(65536)
+                                  if not block:break
+                                  sink.write(block)
+                          output.chmod(member.mode&0o555)
+                  if len(seen)!=18581:raise ValueError('sealed member count')
+              raw=(task/'vendor-manifest.json').read_bytes()
+              if hashlib.sha256(raw).hexdigest()!='08429b3f5b39688dcb927df81881d2c7843c2fe3942bfe170fbd08082528fd6f':raise ValueError('vendor manifest checksum')
+              manifest=json.loads(raw)
+              if manifest['schema']!='universe-electrs-sealed-linux-vendor-v2' or manifest['packageCount']!=233 or len(manifest['files'])!=18580 or manifest['lockSha256']!='a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236':raise ValueError('final233 manifest identity')
+              expected_paths={row['path'] for row in manifest['files']};actual_paths=set()
+              for directory,dirs,names in os.walk(task/'vendor',followlinks=False):
+                  for name in dirs:
+                      if (pathlib.Path(directory)/name).is_symlink():raise ValueError('retained vendor directory link')
+                  for name in names:actual_paths.add((pathlib.Path(directory)/name).relative_to(task).as_posix())
+                  if len(actual_paths)>18580:raise ValueError('retained vendor path count')
+              if actual_paths!=expected_paths:raise ValueError('retained vendor extras/omissions')
+              for row in manifest['files']:
+                  path=task/row['path']
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size!=row['bytes']:raise ValueError('vendor path/size changed')
+                  with path.open('rb') as source:actual=hashlib.file_digest(source,'sha256').hexdigest()
+                  if actual!=row['sha256']:raise ValueError('vendor file checksum changed')
+          except Exception as error:raise SystemExit('vendor stage failed: '+type(error).__name__) from None
+          PY
+          unset GITHUB_TOKEN
+          SOURCE="$TASK/source-$EXPECTED_SHA"
+          if [[ ! -d "$SOURCE" ]]; then mkdir "$SOURCE"; git archive "$EXPECTED_SHA" | tar -x -C "$SOURCE"; fi
+          export SOURCE
+          /usr/bin/python3.12 -B -I -S - <<'PY'
+          import hashlib,os,pathlib,stat,subprocess
+          root=pathlib.Path(os.environ['SOURCE']);sha=os.environ['EXPECTED_SHA']
+          rows=subprocess.check_output(['/usr/bin/git','ls-tree','-rz','--full-tree',sha]).split(b'\0');expected={}
+          for row in rows:
+              if not row:continue
+              header,name=row.split(b'\t',1);mode,kind,blob=header.decode().split();name=name.decode()
+              if kind!='blob' or mode not in ['100644','100755']:raise SystemExit('unsupported source tree entry')
+              expected[name]=blob
+          actual=set()
+          for directory,dirs,names in os.walk(root,followlinks=False):
+              for name in dirs:
+                  if (pathlib.Path(directory)/name).is_symlink():raise SystemExit('source directory link')
+              for name in names:
+                  path=pathlib.Path(directory)/name;relative=path.relative_to(root).as_posix()
+                  if path.is_symlink() or not path.is_file() or path.stat().st_size>33554432 or relative not in expected:raise SystemExit('source path/size changed')
+                  raw=path.read_bytes();blob=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
+                  if blob!=expected[relative]:raise SystemExit('source differs from dispatched Git blob')
+                  actual.add(relative)
+          if actual!=set(expected):raise SystemExit('source pathset incomplete')
+          PY
+          [[ "$(sha256sum "$SOURCE/Cargo.lock" | cut -d' ' -f1)" == a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236 ]]
+          CARGO_HOME="$TASK/cargo-home-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$CARGO_HOME" "$CARGO_HOME/home" "$CARGO_HOME/tmp"
+          cat >"$CARGO_HOME/config.toml" <<EOF
+          [net]
+          offline = true
+          [source.crates-io]
+          replace-with = "vendored-sources"
+          [source."git+https://github.com/mempool/rust-electrum-client?rev=4bbfc612d594fe23282c439d4bdc446cff01ba1c"]
+          git = "https://github.com/mempool/rust-electrum-client"
+          rev = "4bbfc612d594fe23282c439d4bdc446cff01ba1c"
+          replace-with = "vendored-sources"
+          [source.vendored-sources]
+          directory = "$TASK/vendor"
+          EOF
+          UNIT="universe-electrs-cargo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap '/usr/bin/systemctl --user stop "$UNIT.service" >/dev/null 2>&1 || true' EXIT
+          /usr/bin/systemd-run --user --unit="$UNIT" --wait --collect --pipe --service-type=exec \
+            --property=CPUQuota=200% --property=MemoryMax=4G --property=TasksMax=128 \
+            --property=RuntimeMaxSec=1800s --property=TimeoutStopSec=5s --property=KillMode=control-group \
+            --property=Nice=19 --property=IOWeight=1 --property=NoNewPrivileges=yes \
+            /usr/bin/env -i LANG=C HOME="$CARGO_HOME/home" \
+            PATH="$RUST/bin:/usr/bin:/bin" RUSTC="$RUST/bin/rustc" CC="$CC" CXX="$CXX" \
+            AR=/usr/bin/x86_64-linux-gnu-ar LIBCLANG_PATH="$LIBCLANG" \
+            CARGO_HOME="$CARGO_HOME" CARGO_TARGET_DIR="$TASK/target" TMPDIR="$CARGO_HOME/tmp" \
+            GIT_HASH="$EXPECTED_SHA" ELECTRS_SOURCE_REVISION="$EXPECTED_SHA" \
+            "$CARGO" build --release --bin electrs --offline --frozen --jobs 2 --manifest-path "$SOURCE/Cargo.toml"
+          sha256sum "$TASK/target/release/electrs"
+          stat -c 'binary bytes=%s' "$TASK/target/release/electrs"
+          du -sb "$TASK/target"
+          export RUST CC CXX LIBCLANG
+          /usr/bin/python3.12 -B -I -S - <<'PY'
+          import datetime,hashlib,json,os,pathlib,shutil,subprocess,tomllib
+          task=pathlib.Path(os.environ['TASK']);source=pathlib.Path(os.environ['SOURCE']);sha=os.environ['EXPECTED_SHA']
+          binary=task/'target/release/electrs'
+          if binary.is_symlink() or not binary.is_file() or not 1<=binary.stat().st_size<=268435456:raise SystemExit('bounded successful binary required')
+          artifact=pathlib.Path(os.environ['RUNNER_TEMP'])/('universe-electrs-full-artifact-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
+          if artifact.exists() or artifact.is_symlink():raise SystemExit('exclusive deployment artifact destination')
+          artifact.mkdir(mode=0o700);output=artifact/'electrs';shutil.copyfile(binary,output);output.chmod(0o555)
+          def digest(path):
+              with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
+          if digest(binary)!=digest(output):raise SystemExit('binary artifact copy changed')
+          def metadata(command):
+              result=subprocess.run(command,env={'PATH':'/usr/bin:/bin','LANG':'C'},stdin=subprocess.DEVNULL,capture_output=True,timeout=3,check=False)
+              return {'exitCode':result.returncode,'stdout':result.stdout[:16384].decode('utf-8',errors='replace'),
+                      'stderr':result.stderr[:4096].decode('utf-8',errors='replace'),'truncated':len(result.stdout)>16384 or len(result.stderr)>4096}
+          tools={}
+          paths={'rustc':pathlib.Path(os.environ['RUST'])/'bin/rustc','cargo':pathlib.Path(os.environ['RUST'])/'bin/cargo',
+                 'cc':pathlib.Path(os.environ['CC']),'cxx':pathlib.Path(os.environ['CXX']),'ar':pathlib.Path('/usr/bin/x86_64-linux-gnu-ar'),
+                 'ldd':pathlib.Path('/usr/bin/ldd')}
+          for role,path in paths.items():
+              resolved=path.resolve(strict=True)
+              if not resolved.is_file():raise SystemExit('actual tool metadata unavailable')
+              tools[role]={'requestedPath':str(path),'resolvedPath':str(resolved),'sha256':digest(resolved),'version':metadata([str(resolved),'-Vv' if role=='rustc' else '--version'])}
+          clang=(pathlib.Path(os.environ['LIBCLANG'])/'libclang-18.so.18').resolve(strict=True)
+          tools['libclang']={'resolvedPath':str(clang),'sha256':digest(clang),'versionRecordedByLibraryIdentityNotCLI':True}
+          linkage=metadata(['/usr/bin/ldd',str(output)])
+          app=tomllib.loads((source/'Cargo.toml').read_text())
+          lock_sha=digest(source/'Cargo.lock');vendor_sha=digest(task/'final233.tar.gz');manifest_sha=digest(task/'vendor-manifest.json')
+          if lock_sha!='a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236' or vendor_sha!='948afa199b9fdaccc345c7fcccafad9278c3c31137a2ed6b88e4e7302dfbd2d9' or manifest_sha!='08429b3f5b39688dcb927df81881d2c7843c2fe3942bfe170fbd08082528fd6f':raise SystemExit('deployment provenance inputs changed')
+          receipt={'schema':'universe-electrs-ordinary-full-default-build-artifact-v1','observedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   'sourceSha':sha,'package':app['package']['name'],'packageVersion':app['package']['version'],
+                   'cargoLockSha256':lock_sha,'vendorArchiveSha256':vendor_sha,'vendorManifestSha256':manifest_sha,
+                   'applicationFeatureSelection':'default; no --features or --no-default-features overrides','declaredDefaultFeatures':app['features']['default'],
+                   'command':['cargo','build','--release','--bin','electrs','--offline','--frozen','--jobs','2'],
+                   'compileExitCode':0,'binary':{'file':'electrs','sha256':digest(output),'bytes':output.stat().st_size},
+                   'tools':tools,'ldd':linkage,'runtimeDependenciesResolved':linkage['exitCode']==0 and not linkage['truncated'] and 'not found' not in linkage['stdout'],
+                   'targetCacheRetained':True,'recompiledForArtifactCollection':False,'nativeStarted':False,'liveDbOpened':False,'nativeAcceptanceClaim':False,'goClaim':False}
+          raw=(json.dumps(receipt,sort_keys=True,indent=2)+'\n').encode()
+          if len(raw)>65536:raise SystemExit('small provenance receipt bound')
+          with (artifact/'build-provenance.json').open('xb') as stream:stream.write(raw)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as stream:stream.write('artifact_dir='+str(artifact)+'\n')
+          PY
+      - name: Persist successful full binary and provenance for deployment
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: electrs-full-default-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.build.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
