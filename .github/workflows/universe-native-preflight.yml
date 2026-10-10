@@ -25,6 +25,9 @@ on:
       - scripts/universe/locked-cache-readonly.test.py
       - scripts/universe/storage-enforcement-metadata.py
       - scripts/universe/storage-enforcement-metadata.test.py
+      - scripts/universe/helper-runtime-metadata.py
+      - scripts/universe/helper-runtime-metadata.test.py
+      - scripts/universe/inspect-fuse-packages.py
 
 permissions:
   contents: read
