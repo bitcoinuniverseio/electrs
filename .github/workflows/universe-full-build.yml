@@ -27,7 +27,7 @@ jobs:
       contents: write
     if: github.repository == 'bitcoinuniverseio/electrs' && github.ref == 'refs/heads/develop'
     runs-on: [self-hosted, universe-runners-1]
-    timeout-minutes: 35
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -234,7 +234,7 @@ jobs:
           source "$CARGO_HOME/bindgen-resource.env"
           /usr/bin/systemd-run --user --unit="$UNIT" --wait --collect --pipe --service-type=exec \
             --property=CPUQuota=200% --property=MemoryMax=4G --property=TasksMax=128 \
-            --property=RuntimeMaxSec=1800s --property=TimeoutStopSec=5s --property=KillMode=control-group \
+            --property=RuntimeMaxSec=3600s --property=TimeoutStopSec=5s --property=KillMode=control-group \
             --property=Nice=19 --property=IOWeight=1 --property=NoNewPrivileges=yes \
             /usr/bin/env -i LANG=C HOME="$CARGO_HOME/home" \
             PATH="$RUST/bin:/usr/bin:/bin" RUSTC="$RUST/bin/rustc" CC="$CC" CXX="$CXX" \
