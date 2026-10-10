@@ -1,4 +1,4 @@
-name: Universe native source preflight only
+name: Universe native prerequisites and isolated scope proof
 
 on:
   workflow_dispatch:
@@ -9,6 +9,9 @@ on:
       - scripts/universe/native-preflight.py
       - scripts/universe/native-preflight.test.py
       - scripts/universe/native-tool-requirements.json
+      - scripts/universe/sandbox-proof.py
+      - scripts/universe/sandbox-proof-child.py
+      - scripts/universe/sandbox-proof.test.py
 
 permissions:
   contents: read
@@ -36,3 +39,10 @@ jobs:
         run: |
           set -euo pipefail
           /usr/bin/python3 scripts/universe/native-preflight.py
+      - name: Verify one bounded isolated user-unit scope without a build
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -B -I -S scripts/universe/sandbox-proof.py --run-proof
