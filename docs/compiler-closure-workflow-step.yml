@@ -1,0 +1,9 @@
+# REVIEW PAYLOAD ONLY. Not in .github/workflows; creates no dispatch trigger.
+# Replace the failed ONE-proof operational step with this metadata-only step.
+- name: Read actual pressure and bounded existing compiler closure
+  shell: bash
+  env:
+    EXPECTED_SOURCE_SHA: ${{ github.sha }}
+  run: |
+    set -euo pipefail
+    /usr/bin/python3.12 -B -I -S scripts/universe/compiler-closure-metadata.py --observe-owned-compiler

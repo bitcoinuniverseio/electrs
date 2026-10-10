@@ -1,4 +1,4 @@
-name: Universe private draft ONE small FUSE proof
+name: Universe pressure and compiler closure metadata only
 
 on:
   workflow_dispatch:
@@ -32,6 +32,9 @@ on:
       - scripts/universe/draft-helper-proof-driver.test.py
       - scripts/universe/receive-helper-transfer.py
       - scripts/universe/small-fuse-image-proof.py
+      - scripts/universe/compiler-closure-metadata.py
+      - scripts/universe/compiler-closure-metadata.test.py
+      - scripts/universe/inspect-fuse-packages.py
 
 permissions:
   contents: read
@@ -52,11 +55,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Verify private draft assets and run ONE bounded small image proof
+      - name: Observe pressure and bounded existing compiler closure
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          /usr/bin/python3.12 -B -I -S scripts/universe/draft-helper-proof-driver.py --run-one-small-proof
+          /usr/bin/python3.12 -B -I -S scripts/universe/compiler-closure-metadata.py --observe-owned-compiler

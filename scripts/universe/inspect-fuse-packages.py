@@ -56,8 +56,8 @@ def decompress(data):
     return result.stdout
 
 
-def elf_metadata(raw):
-    if len(raw) > MAX_DATA or len(raw) < 64 or raw[:7] != b'\x7fELF\x02\x01\x01': raise ValueError('Linux ELF64 little-endian required')
+def elf_metadata(raw, maximum_bytes=MAX_DATA, allow_runpath=False):
+    if maximum_bytes > 256 * 1024**2 or len(raw) > maximum_bytes or len(raw) < 64 or raw[:7] != b'\x7fELF\x02\x01\x01': raise ValueError('Linux ELF64 little-endian required')
     header = struct.unpack_from('<HHIQQQIHHHHHH', raw, 16)
     kind, machine, version, _, phoff, _, _, _, phsize, phcount, *_ = header
     if kind not in [2, 3] or machine != 62 or version != 1 or phsize != 56 or phcount > 128 or phoff + phcount * 56 > len(raw): raise ValueError('bounded x86_64 ELF headers required')
@@ -97,7 +97,13 @@ def elf_metadata(raw):
     needed = [string(value) for value in tags.get(1, [])]
     soname = string(tags[14][0]) if len(tags.get(14, [])) == 1 else None
     if len(tags.get(14, [])) > 1 or (not needed and soname != 'ld-linux-x86-64.so.2') or len(needed) > 32 or len(set(needed)) != len(needed): raise ValueError('ELF dependency count')
-    if tags.get(15) or tags.get(29): raise ValueError('unexpected ELF RPATH/RUNPATH')
+    runpaths = []
+    if tags.get(15) or tags.get(29):
+        if not allow_runpath: raise ValueError('unexpected ELF RPATH/RUNPATH')
+        for index in tags.get(15, []) + tags.get(29, []):
+            end = strings.find(b'\0', index)
+            if index >= len(strings) or end < 0 or end - index > 1024: raise ValueError('bounded compiler runpath required')
+            runpaths.append(strings[index:end].decode('ascii'))
     versions = []
     definitions = []
     if tags.get(0x6ffffffc):
@@ -131,7 +137,7 @@ def elf_metadata(raw):
             address += following
     return {'elfClass': 'ELF64_LE', 'machine': 'x86_64', 'type': kind, 'interpreter': interpreter,
             'needed': needed, 'soname': soname, 'versionNeeds': versions,
-            'versionDefinitions': sorted(set(definitions)), 'executed': False}
+            'versionDefinitions': sorted(set(definitions)), 'runPaths': runpaths, 'executed': False}
 
 
 def inspect_data(raw):

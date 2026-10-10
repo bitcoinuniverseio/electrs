@@ -137,15 +137,40 @@ def assets(transport, root):
 
 
 def run():
-    guard = load('owned_draft_guard', 'locked-cache-readonly.py'); source = guard.runtime_guard()
-    inventory = load('draft_git_guard', 'locked-source-inventory.py'); guard.source_guard(inventory, source)
-    temp = pathlib.Path(os.environ['RUNNER_TEMP']); resources = guard.headroom_report(temp)
-    load('draft_pressure', 'confinement-proof.py').headroom(resources)
+    token = os.environ.pop('GITHUB_TOKEN', None)
+    source = None; resources = None; phase = 'runtime-source-admission'
+    try:
+        guard = load('owned_draft_guard', 'locked-cache-readonly.py'); source = guard.runtime_guard()
+        inventory = load('draft_git_guard', 'locked-source-inventory.py'); guard.source_guard(inventory, source)
+        temp = pathlib.Path(os.environ['RUNNER_TEMP']); resources = guard.headroom_report(temp)
+        phase = 'pressure-admission'
+        load('draft_pressure', 'confinement-proof.py').headroom(resources)
+    except Exception as error:
+        token = None
+        # Only fixed /proc memory/PSI and statvfs observations are eligible.
+        # No original exception text, environment, credentials or URL is emitted.
+        observed = None
+        if isinstance(resources, dict):
+            memory = resources.get('memoryKiB', {}).get('MemAvailable')
+            free = resources.get('freeTempBytes')
+            pressure = resources.get('pressure', {})
+            if type(memory) is int and memory >= 0 and type(free) is int and free >= 0 and all(
+                    isinstance(pressure.get(kind), str) and len(pressure[kind]) <= 4096 for kind in ['cpu', 'io']):
+                observed = {'availableMemoryKiB': memory, 'freeTemporaryBytes': free,
+                            'pressure': {kind: pressure[kind] for kind in ['cpu', 'io']}}
+        return {'schema': 'universe-electrs-private-draft-small-proof-driver-v1', 'sourceSha': source,
+                'observedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'repositoryId': REPO_ID, 'releaseId': RELEASE_ID, 'draftVerified': False,
+                'assets': [], 'requests': 0, 'networkBytes': 0, 'automaticRetries': 0,
+                'result': None, 'failure': {'phase': phase, 'type': type(error).__name__,
+                                          'reason': 'admission rejected; no transfer or scope started'},
+                'observedResources': observed, 'driverReceipt': None,
+                'credentialsOrSignedUrlsRecorded': False, 'sourceRustWipNotCompiled': True,
+                'fullRustBuild': False, 'nativeIndexerActions': False}
     run_id = os.environ['GITHUB_RUN_ID']; attempt = os.environ['GITHUB_RUN_ATTEMPT']; nonce = os.urandom(8).hex()
     import re
     if not re.fullmatch('[0-9]{1,20}', run_id) or not re.fullmatch('[0-9]{1,3}', attempt): raise ValueError('exact owned run/attempt required')
     root = temp / ('universe-electrs-draft-transfer-' + run_id + '-' + attempt + '-' + nonce); root.mkdir(mode=0o700)
-    token = os.environ.pop('GITHUB_TOKEN', None)
     transport = Transport(token); token = None
     phase = 'draft-download'; result = None; failure = None; records = []
     try:

@@ -125,5 +125,26 @@ class DriverTests(unittest.TestCase):
             self.assertNotIn('CONTROLLED_SYNTHETIC_TOKEN', json.dumps(result))
         self.assertEqual(calls, ['receive', 'proof']); proof.launch.assert_called_once()
 
+    def test_pressure_rejection_records_fixed_observations_and_never_transfers(self):
+        guard = Mock(); guard.runtime_guard.return_value = 'a' * 40
+        resources = {'memoryKiB': {'MemAvailable': 14000000}, 'freeTempBytes': 10000000000,
+                     'pressure': {'cpu': 'some avg10=26.0 avg60=26.0 avg300=26.0 total=1\n',
+                                  'io': 'some avg10=0.0 avg60=0.0 avg300=0.0 total=1\n'}}
+        guard.headroom_report.return_value = resources
+        pressure = Mock(); pressure.headroom.side_effect = ValueError('PRIVATE_SIGNED_OR_TOKEN_VALUE')
+        def loaded(name, filename):
+            return guard if filename == 'locked-cache-readonly.py' else pressure if filename == 'confinement-proof.py' else Mock()
+        with patch.object(draft, 'load', side_effect=loaded), patch.object(draft, 'Transport') as transfer, patch.dict(
+                draft.os.environ, {'RUNNER_TEMP': '/controlled', 'GITHUB_TOKEN': 'CONTROLLED_SYNTHETIC_TOKEN'}):
+            result = draft.run()
+            self.assertNotIn('GITHUB_TOKEN', draft.os.environ)
+            transfer.assert_not_called()
+        self.assertEqual(result['failure']['phase'], 'pressure-admission')
+        self.assertEqual(result['observedResources']['pressure'], resources['pressure'])
+        self.assertEqual(result['requests'], 0)
+        self.assertIsNone(result['driverReceipt'])
+        self.assertNotIn('PRIVATE_SIGNED_OR_TOKEN_VALUE', json.dumps(result))
+        self.assertNotIn('CONTROLLED_SYNTHETIC_TOKEN', json.dumps(result))
+
 
 if __name__ == '__main__': unittest.main()
