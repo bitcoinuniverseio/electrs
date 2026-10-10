@@ -175,6 +175,32 @@ impl Mutation<'_> {
     ) -> Result<u64, &'static str> {
         self.publish(true)
     }
+    #[cfg(not(feature = "liquid"))]
+    pub(crate) fn commit_baseline(
+        mut self,
+        proof: super::schema::CompletedBaseline,
+        scope: &str,
+        height: u32,
+        hash: &crate::chain::BlockHash,
+    ) -> Result<u64, &'static str> {
+        if !proof.matches(scope, height, hash) || self.owner.state.is_poisoned() {
+            return Err("baseline closure mismatch");
+        }
+        let mut state = self.owner.writer_state();
+        let odd = self.odd.ok_or("read generation exhausted")?;
+        if state.active != Some(odd) || state.sequence != odd || state.exhausted {
+            return Err("baseline publication superseded");
+        }
+        let even = odd.checked_add(1).ok_or("read generation exhausted")?;
+        state.sequence = even;
+        state.active = None;
+        state.dirty = false;
+        state.availability_only = false;
+        state.material_completed = true;
+        state.startup_unqualified = false;
+        self.committed = true;
+        Ok(even)
+    }
     fn publish(mut self, repaired: bool) -> Result<u64, &'static str> {
         if self.owner.state.is_poisoned() {
             return Err("poisoned publication");

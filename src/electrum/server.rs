@@ -321,7 +321,7 @@ impl Connection {
     #[cfg(not(feature = "liquid"))]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
-        let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
+        let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..])?;
 
         Ok(json!({
             "confirmed": chain_stats.funded_txo_sum - chain_stats.spent_txo_sum,

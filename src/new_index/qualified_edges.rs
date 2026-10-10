@@ -1,7 +1,6 @@
-//! Source-only groundwork for a supplemental, block-qualified spending index.
-//! No namespace is written, producer lifecycle changed, or historical coverage
-//! inferred here. Existing stores remain unqualified until a separate checked
-//! completeness/recovery adapter supplies actual evidence.
+//! Supplemental block-qualified spending index used by the existing history
+//! writer. Existing-store historical completeness is deliberately separate:
+//! writing future edges never grants historical coverage or startup readiness.
 use std::convert::TryInto;
 
 pub const EDGE_KEY_BYTES: usize = 146;
@@ -9,6 +8,25 @@ pub const MAX_VISITS: usize = 500;
 pub const MAX_TOTAL_VISITS: usize = 1_000_000;
 pub const MAX_HISTORY_KEY: usize = 256;
 const DOMAIN: [u8; 4] = [0xff, b'U', b'E', 1];
+
+/// One logical request budget, shared by all nested point reads and output
+/// workers. Reserving never resets on a nested call or after partial success.
+pub struct ReadBudget(std::sync::atomic::AtomicUsize);
+impl ReadBudget {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(0))
+    }
+    pub fn reserve(&self, reads: usize) -> Result<(), EdgeError> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(reads)
+                    .filter(|next| *next <= MAX_TOTAL_VISITS)
+            })
+            .map(|_| ())
+            .map_err(|_| EdgeError::Capacity)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EdgeKey {
@@ -33,7 +51,7 @@ pub enum EdgeError {
 }
 
 impl EdgeKey {
-    /// Proposed versioned namespace only. Exact block hash prevents deleting
+    /// Versioned supplemental namespace. Exact block hash prevents deleting
     /// an orphan occurrence from erasing an ancestor's identical legacy S key.
     pub fn encode(self) -> [u8; EDGE_KEY_BYTES] {
         let mut key = [0u8; EDGE_KEY_BYTES];
@@ -73,11 +91,16 @@ impl EdgeKey {
         })
     }
 
-    pub fn outpoint_prefix(self) -> [u8; 72] {
-        let encoded = self.encode();
+    pub fn prefix(script_hash: [u8; 32], funding_txid: [u8; 32], funding_vout: u32) -> [u8; 72] {
         let mut prefix = [0; 72];
-        prefix.copy_from_slice(&encoded[..72]);
+        prefix[..4].copy_from_slice(&DOMAIN);
+        prefix[4..36].copy_from_slice(&script_hash);
+        prefix[36..68].copy_from_slice(&funding_txid);
+        prefix[68..72].copy_from_slice(&funding_vout.to_be_bytes());
         prefix
+    }
+    pub fn outpoint_prefix(self) -> [u8; 72] {
+        Self::prefix(self.script_hash, self.funding_txid, self.funding_vout)
     }
 
     /// Both caller-supplied funding and spending block membership still need
@@ -86,6 +109,30 @@ impl EdgeKey {
         self.spending_height > funding_height
             || (self.spending_height == funding_height && self.spending_position > funding_position)
     }
+}
+
+/// Existing fixed-int little-endian X roster: u64 count then exact 32-byte
+/// transaction hashes. Check length BEFORE deserializing/allocating a vector.
+/// Missing, duplicate, oversized or truncated roster is unavailable, not a
+/// fabricated transaction position. Full caller verifies the header Merkle root.
+pub fn roster_position(raw: &[u8], txid: [u8; 32]) -> Result<u16, EdgeError> {
+    if raw.len() < 8 || raw.len() > 4 * 1024 * 1024 {
+        return Err(EdgeError::Capacity);
+    }
+    let count = u64::from_le_bytes(raw[..8].try_into().map_err(|_| EdgeError::Encoding)?);
+    if count == 0 || count > u16::MAX as u64 || 8 + count * 32 != raw.len() as u64 {
+        return Err(EdgeError::Encoding);
+    }
+    let mut found = None;
+    for (position, hash) in raw[8..].chunks_exact(32).enumerate() {
+        if hash == txid {
+            if found.is_some() {
+                return Err(EdgeError::Encoding);
+            }
+            found = Some(position as u16);
+        }
+    }
+    found.ok_or(EdgeError::MissingCoverage)
 }
 
 /// Retain exactly the original bounded deletion keys. Never regenerate keys
@@ -266,6 +313,20 @@ impl BaselineProgress {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_and_parallel_readers_share_one_nonresetting_request_budget() {
+        let budget = std::sync::Arc::new(super::ReadBudget::new());
+        budget.reserve(super::MAX_TOTAL_VISITS - 2).unwrap();
+        let a = budget.clone();
+        let b = budget.clone();
+        let first = std::thread::spawn(move || a.reserve(2));
+        let second = std::thread::spawn(move || b.reserve(2));
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(budget.reserve(1), Err(super::EdgeError::Capacity));
+        // A rejected reservation did not wrap the counter or reset admission.
+        assert_eq!(budget.reserve(usize::MAX), Err(super::EdgeError::Capacity));
+    }
     use super::*;
     use std::collections::BTreeMap;
     fn edge(height: u32, hash: u8) -> EdgeKey {
@@ -352,6 +413,21 @@ mod tests {
             DeleteIntent::new([8; 32], &vec![edge(100, 8); 501]),
             Err(EdgeError::Capacity)
         ));
+    }
+
+    #[test]
+    fn local_roster_position_rejects_missing_duplicate_truncated_and_forged_length() {
+        let roster = [&2u64.to_le_bytes()[..], &[1; 32][..], &[2; 32][..]].concat();
+        assert_eq!(roster_position(&roster, [1; 32]), Ok(0));
+        assert_eq!(roster_position(&roster, [2; 32]), Ok(1));
+        assert_eq!(
+            roster_position(&roster, [3; 32]),
+            Err(EdgeError::MissingCoverage)
+        );
+        assert!(roster_position(&roster[..70], [1; 32]).is_err());
+        assert!(roster_position(&u64::MAX.to_le_bytes(), [1; 32]).is_err());
+        let duplicate = [&2u64.to_le_bytes()[..], &[1; 32][..], &[1; 32][..]].concat();
+        assert!(roster_position(&duplicate, [1; 32]).is_err());
     }
 
     #[test]

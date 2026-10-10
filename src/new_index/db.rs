@@ -146,6 +146,22 @@ pub struct BoundedSnapshot<'a> {
 }
 #[cfg(not(feature = "liquid"))]
 impl BoundedSnapshot<'_> {
+    pub fn point_value(
+        &self,
+        key: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Bytes>, super::paged_outputs::PageError> {
+        use super::paged_outputs::PageError;
+        let value = self
+            .snapshot
+            .get_pinned(key)
+            .map_err(|_| PageError::Storage)?;
+        match value {
+            Some(value) if value.len() <= maximum => Ok(Some(value.to_vec())),
+            Some(_) => Err(PageError::Capacity),
+            None => Ok(None),
+        }
+    }
     pub fn next_record(
         &self,
         prefix: &[u8],
@@ -201,6 +217,14 @@ pub enum DBFlush {
 }
 
 impl DB {
+    pub(crate) fn open_proof_read_only(path: &Path) -> crate::errors::Result<Self> {
+        use crate::errors::ResultExt;
+        let options = rocksdb::Options::default();
+        Ok(Self {
+            db: rocksdb::DB::open_for_read_only(&options, path, false)
+                .chain_err(|| "local proof store unavailable")?,
+        })
+    }
     pub fn open(path: &Path, config: &Config) -> DB {
         let db = DB {
             db: open_raw_db(path, OpenMode::ReadWrite),
@@ -318,6 +342,57 @@ impl DB {
             .chain_err(|| "failed to delete DB batch")
     }
 
+    pub(crate) fn next_empty_record(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+    ) -> crate::errors::Result<Option<DBRow>> {
+        use crate::errors::ResultExt;
+        if prefix.is_empty()
+            || prefix.len() > 256
+            || after.map_or(false, |key| key.len() > 256 || !key.starts_with(prefix))
+        {
+            return Err("invalid exact scan cursor".into());
+        }
+        let mut start = after.unwrap_or(prefix).to_vec();
+        if after.is_some() {
+            start.push(0);
+        }
+        let mut iterator = self.db.raw_iterator();
+        iterator.seek(&start);
+        iterator.status().chain_err(|| "confirmation scan failed")?;
+        if !iterator.valid() {
+            return Ok(None);
+        }
+        let key = iterator.key().ok_or("confirmation scan missing key")?;
+        if !key.starts_with(prefix) {
+            return Ok(None);
+        }
+        let value = iterator.value().ok_or("confirmation scan missing value")?;
+        if key.len() > 256 || !value.is_empty() {
+            return Err("malformed confirmation record".into());
+        }
+        let row = DBRow {
+            key: key.to_vec(),
+            value: vec![],
+        };
+        iterator.status().chain_err(|| "confirmation scan failed")?;
+        Ok(Some(row))
+    }
+    /// Supplemental proof/progress writes use the existing DB owner, with a
+    /// single sync/WAL-enabled atomic batch. Errors never advance progress.
+    pub(crate) fn write_coverage(&self, rows: Vec<DBRow>) -> crate::errors::Result<()> {
+        use crate::errors::ResultExt;
+        let mut batch = rocksdb::WriteBatch::default();
+        for row in rows {
+            batch.put(row.key, row.value);
+        }
+        let mut options = rocksdb::WriteOptions::new();
+        options.set_sync(true);
+        self.db
+            .write_opt(batch, &options)
+            .chain_err(|| "coverage batch write failed")
+    }
     pub fn flush(&self) {
         self.db.flush().unwrap();
     }
@@ -449,6 +524,9 @@ pub(crate) fn history_cache_keys(key: &[u8], liquid: bool) -> Result<Vec<Vec<u8>
     let mut keys = vec![[b"A", hash].concat(), [b"U", hash].concat()];
     if liquid {
         keys.push([b"z", hash].concat());
+    } else {
+        keys.push([&[0xff, b'U', b'A', 2][..], hash].concat());
+        keys.push([&[0xff, b'U', b'U', 2][..], hash].concat());
     }
     Ok(keys)
 }
@@ -471,13 +549,15 @@ mod bounded_cache_delete_tests {
                 } else {
                     vec![b'A', b'U']
                 };
-                assert_eq!(
-                    keys,
-                    prefixes
-                        .into_iter()
-                        .map(|prefix| [&[prefix][..], &[7; 32][..]].concat())
-                        .collect::<Vec<_>>()
-                );
+                let mut expected = prefixes
+                    .into_iter()
+                    .map(|prefix| [&[prefix][..], &[7; 32][..]].concat())
+                    .collect::<Vec<_>>();
+                if !liquid {
+                    expected.push([&[0xff, b'U', b'A', 2][..], &[7; 32][..]].concat());
+                    expected.push([&[0xff, b'U', b'U', 2][..], &[7; 32][..]].concat());
+                }
+                assert_eq!(keys, expected);
             }
         }
         for code in [b'D', b'S', b'a', b'i'] {

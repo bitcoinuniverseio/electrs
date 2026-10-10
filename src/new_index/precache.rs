@@ -31,7 +31,7 @@ pub fn precache(chain: Arc<ChainQuery>, scripthashes: Vec<FullHash>, threads: us
                 .par_iter()
                 .for_each(|scripthash| {
                     // First, cache
-                    chain.stats(&scripthash[..], crate::new_index::db::DBFlush::Disable);
+                    let _ = chain.stats(&scripthash[..], crate::new_index::db::DBFlush::Disable);
                     let _ = chain.utxo(&scripthash[..], usize::MAX, crate::new_index::db::DBFlush::Disable);
 
                     // Then, increment the counter

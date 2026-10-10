@@ -17,7 +17,7 @@ use elements::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -45,6 +45,10 @@ const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
 pub struct Store {
     read_generation: ReadGeneration,
+    #[cfg(not(feature = "liquid"))]
+    coverage_scope: RwLock<Option<String>>,
+    #[cfg(not(feature = "liquid"))]
+    proof_txstore: Option<DB>,
     // TODO: should be column families
     txstore_db: DB,
     history_db: DB,
@@ -94,12 +98,38 @@ impl Store {
             txstore_db,
             history_db,
             cache_db,
+            #[cfg(not(feature = "liquid"))]
+            coverage_scope: RwLock::new(None),
+            #[cfg(not(feature = "liquid"))]
+            proof_txstore: config.history_proof_dir.as_ref().map(|directory| {
+                DB::open_proof_read_only(&directory.join("txstore"))
+                    .expect("explicit local proof store unavailable")
+            }),
             added_blockhashes: RwLock::new(added_blockhashes),
             indexed_blockhashes: RwLock::new(indexed_blockhashes),
             indexed_headers: RwLock::new(headers),
         }
     }
 
+    #[cfg(not(feature = "liquid"))]
+    fn proof_point(
+        &self,
+        key: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Bytes>, super::qualification::QualifiedReadError> {
+        match self.txstore_db.qualified_get(key, maximum)? {
+            Some(value) => Ok(Some(value)),
+            None => {
+                if !matches!(key.first(), Some(b'T') | Some(b'X') | Some(b'M')) {
+                    return Ok(None);
+                }
+                match &self.proof_txstore {
+                    Some(store) => store.qualified_get(key, maximum),
+                    None => Ok(None),
+                }
+            }
+        }
+    }
     pub fn txstore_db(&self) -> &DB {
         &self.txstore_db
     }
@@ -193,6 +223,121 @@ pub struct Indexer {
     iconfig: IndexerConfig,
     duration: HistogramVec,
     tip_metric: Gauge,
+    #[cfg(not(feature = "liquid"))]
+    baseline_profile: super::read_context::StaticReadProfile,
+    #[cfg(not(feature = "liquid"))]
+    baseline: Option<BaselineRuntime>,
+    #[cfg(not(feature = "liquid"))]
+    verified_prefix: Option<super::history_coverage::Prefix>,
+    #[cfg(not(feature = "liquid"))]
+    prefix_recovery: Option<PrefixRecovery>,
+    #[cfg(not(feature = "liquid"))]
+    baseline_total_visits: String,
+}
+
+#[cfg(not(feature = "liquid"))]
+struct PrefixRecovery {
+    cursor: super::history_coverage::Prefix,
+    target_height: u32,
+    target_hash: String,
+}
+#[cfg(not(feature = "liquid"))]
+struct BaselineRuntime {
+    progress: super::history_coverage::Progress,
+    header: Option<HeaderEntry>,
+    roster: Vec<Txid>,
+    roster_seen: super::history_coverage::RosterProof,
+    transaction: Option<Transaction>,
+    edges: Vec<[u8; super::qualified_edges::EDGE_KEY_BYTES]>,
+    certificates_verified: bool,
+}
+#[cfg(not(feature = "liquid"))]
+pub(crate) struct CompletedBaseline {
+    scope: String,
+    height: u32,
+    hash: BlockHash,
+}
+#[cfg(not(feature = "liquid"))]
+impl CompletedBaseline {
+    pub(crate) fn matches(&self, scope: &str, height: u32, hash: &BlockHash) -> bool {
+        self.scope == scope && self.height == height && &self.hash == hash
+    }
+}
+
+#[cfg(not(feature = "liquid"))]
+fn baseline_point(
+    store: &Store,
+    key: &[u8],
+    maximum: usize,
+    window: &mut super::history_coverage::Window,
+) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+    use super::history_coverage::CoverageError;
+    window.reserve(1, 1 + maximum / 32)?;
+    // Reserve primary and explicit fallback before either dispatch.
+    if store.proof_txstore.is_some() && matches!(key.first(), Some(b'T') | Some(b'X') | Some(b'M'))
+    {
+        window.reserve(1, 1 + maximum / 32)?;
+    }
+    store
+        .proof_point(key, maximum)
+        .map_err(|_| CoverageError::Storage)?
+        .ok_or(CoverageError::Missing)
+}
+#[cfg(not(feature = "liquid"))]
+fn baseline_history_point(
+    db: &DB,
+    key: &[u8],
+    maximum: usize,
+    window: &mut super::history_coverage::Window,
+) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+    window.reserve(1, 1 + maximum / 32)?;
+    db.qualified_get(key, maximum)
+        .map_err(|_| super::history_coverage::CoverageError::Storage)?
+        .ok_or(super::history_coverage::CoverageError::Missing)
+}
+
+#[cfg(not(feature = "liquid"))]
+fn increment_atomic(value: &str) -> Result<String, super::history_coverage::CoverageError> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| super::history_coverage::CoverageError::Contract)?;
+    Ok(value
+        .checked_add(1)
+        .ok_or(super::history_coverage::CoverageError::Overflow)?
+        .to_string())
+}
+#[cfg(not(feature = "liquid"))]
+fn decode_digest(value: &str) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+    if value.len() != 64 {
+        return Err(super::history_coverage::CoverageError::Contract);
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .ok_or(super::history_coverage::CoverageError::Contract)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "liquid"))]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerCache<T> {
+    schema_version: u16,
+    scope_digest: String,
+    computation_version: String,
+    block_hash: BlockHash,
+    payload: T,
+}
+#[cfg(not(feature = "liquid"))]
+fn ledger_cache_key(kind: u8, script: &[u8]) -> Vec<u8> {
+    let mut key = vec![0xff, b'U', kind, 2];
+    key.extend_from_slice(script);
+    key
 }
 
 struct IndexerConfig {
@@ -246,6 +391,39 @@ impl Indexer {
         Indexer {
             pending_read_update: None,
             availability_validation_tip: None,
+            #[cfg(not(feature = "liquid"))]
+            baseline: None,
+            #[cfg(not(feature = "liquid"))]
+            verified_prefix: None,
+            #[cfg(not(feature = "liquid"))]
+            prefix_recovery: None,
+            #[cfg(not(feature = "liquid"))]
+            baseline_total_visits: "0".into(),
+            #[cfg(not(feature = "liquid"))]
+            baseline_profile: super::read_context::StaticReadProfile {
+                network: match config.network_type {
+                    Network::Bitcoin => "mainnet",
+                    Network::Testnet => "testnet",
+                    Network::Testnet4 => "testnet4",
+                    Network::Signet => "signet",
+                    Network::Regtest => "regtest",
+                }
+                .into(),
+                magic: config.magic,
+                db_path: config.db_path.to_string_lossy().into_owned(),
+                rpc_address: config.daemon_rpc_addr.to_string(),
+                light_mode: config.light_mode,
+                index_unspendables: config.index_unspendables,
+                db_version: super::db::DB_VERSION,
+                electrs_version: crate::config::ELECTRS_VERSION.into(),
+                electrum_discovery: cfg!(feature = "electrum-discovery"),
+                work_limit: super::paged_outputs::WORK_LIMIT,
+                body_limit: super::paged_outputs::BODY_LIMIT,
+                history_proof_dir: config
+                    .history_proof_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            },
             store,
             flush: DBFlush::Disable,
             from,
@@ -256,6 +434,822 @@ impl Indexer {
             ),
             tip_metric: metrics.gauge(MetricOpts::new("tip_height", "Current chain tip height")),
         }
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn continue_local_baseline(&mut self, daemon: &Daemon, current_tip: &BlockHash) {
+        if self.pending_read_update.is_some() {
+            return;
+        }
+        if self.store.read_generation.completed().is_some()
+            && self
+                .store
+                .coverage_scope
+                .try_read()
+                .map_or(false, |scope| scope.is_some())
+            && self.baseline.is_none()
+        {
+            return;
+        }
+        if let Err(error) = self.baseline_invocation(daemon, current_tip) {
+            // Supplemental proof failure never aborts valid canonical indexing.
+            // No progress/certificate is treated as ready after a failed step.
+            self.store.read_generation.invalidate_material();
+            self.baseline = None;
+            self.verified_prefix = None;
+            self.prefix_recovery = None;
+            if let Ok(mut scope) = self.store.coverage_scope.write() {
+                *scope = None;
+            }
+            warn!("history coverage unavailable: {:?}", error);
+        }
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn baseline_scope(
+        &self,
+        daemon: &Daemon,
+    ) -> Result<super::history_coverage::CoverageScope, super::history_coverage::CoverageError>
+    {
+        use super::history_coverage::{digest, CoverageError, CoverageScope};
+        let revision = option_env!("ELECTRS_SOURCE_REVISION").ok_or(CoverageError::Missing)?;
+        let bootstrap = daemon
+            .paged_bootstrap_observation()
+            .filter(|value| value.validate(&self.baseline_profile.network))
+            .ok_or(CoverageError::Missing)?;
+        if self.baseline_profile.network == "signet" && bootstrap.height == 0 {
+            return Err(CoverageError::Missing);
+        }
+        let genesis = self
+            .store
+            .indexed_headers
+            .try_read()
+            .map_err(|_| CoverageError::Changed)?
+            .header_by_height(0)
+            .map(|header| *header.hash())
+            .ok_or(CoverageError::Missing)?;
+        if genesis != crate::chain::genesis_hash(self.iconfig.network) {
+            return Err(CoverageError::Changed);
+        }
+        let profile = self
+            .baseline_profile
+            .bytes(bootstrap)
+            .map_err(|_| CoverageError::Contract)?;
+        let scope = CoverageScope {
+            schema_version: 2,
+            chain: "bitcoin".into(),
+            network: self.baseline_profile.network.clone(),
+            genesis_hash: genesis.to_string(),
+            source_revision: revision.into(),
+            profile_sha256: digest(b"", &profile),
+            namespace_schema_sha256: digest(
+                b"",
+                b"UE1:146/UP2:36/UC2:72/UA2:36/UU2:36;canonical-json-v2;funding-height-position-v2",
+            ),
+            signet_challenge_sha256: bootstrap.signet_challenge_sha256.clone(),
+            light_mode: self.iconfig.light_mode,
+            index_unspendables: self.iconfig.index_unspendables,
+            address_search: self.iconfig.address_search,
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn persist_recovery_window(
+        &mut self,
+        scope: &super::history_coverage::CoverageScope,
+        height: u32,
+        hash: &BlockHash,
+        window: &mut super::history_coverage::Window,
+    ) -> Result<(), super::history_coverage::CoverageError> {
+        use super::history_coverage::{CoverageError, Progress};
+        // Persist accounting, never an orphan prefix as a ready certificate.
+        // Restart will revalidate from genesis and carry this cumulative count.
+        let mut state = Progress::initial(scope.clone(), height, hash.to_string())?;
+        state.total_visits_atomic = self.baseline_total_visits.clone();
+        window.persist_cumulative(&mut state)?;
+        self.store
+            .history_db
+            .write_coverage(vec![DBRow {
+                key: state.progress_key()?,
+                value: state.encode()?,
+            }])
+            .map_err(|_| CoverageError::Storage)?;
+        self.baseline_total_visits = state.total_visits_atomic;
+        Ok(())
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn baseline_invocation(
+        &mut self,
+        daemon: &Daemon,
+        current_tip: &BlockHash,
+    ) -> Result<(), super::history_coverage::CoverageError> {
+        use super::history_coverage::{
+            self as coverage, digest, BlockCertificate, CoverageError, Phase, Progress, Window,
+        };
+        use bitcoin::hashes::Hash;
+        let mut window = Window::new();
+        window.reserve(4, 1000)?;
+        let scope = self.baseline_scope(daemon)?;
+        // Reserve the terminal progress write before any owned work starts.
+        window.reserve(1, 1 + coverage::PROGRESS_BYTES / 32)?;
+        let target = {
+            let headers = self
+                .store
+                .indexed_headers
+                .try_read()
+                .map_err(|_| CoverageError::Changed)?;
+            if headers.tip() != current_tip {
+                return Err(CoverageError::Changed);
+            }
+            headers
+                .header_by_blockhash(current_tip)
+                .cloned()
+                .ok_or(CoverageError::Missing)?
+        };
+        if baseline_point(&self.store, b"t", 32, &mut window)? != serialize(current_tip) {
+            return Err(CoverageError::Changed);
+        }
+        if let Some(mut recovery) = self.prefix_recovery.take() {
+            let scope_digest = scope.commitment()?;
+            while recovery.cursor.height > recovery.target_height {
+                let mut key = vec![0xff, b'U', b'C', 2];
+                key.extend(decode_digest(&scope_digest)?);
+                key.extend(recovery.cursor.height.to_be_bytes());
+                key.extend(decode_digest(&recovery.cursor.block_hash)?);
+                let bytes = match baseline_history_point(
+                    &self.store.history_db,
+                    &key,
+                    coverage::CERTIFICATE_BYTES,
+                    &mut window,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(CoverageError::Budget) => {
+                        self.persist_recovery_window(
+                            &scope,
+                            target.height() as u32,
+                            current_tip,
+                            &mut window,
+                        )?;
+                        self.prefix_recovery = Some(recovery);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let certificate: BlockCertificate =
+                    serde_json::from_slice(&bytes).map_err(|_| CoverageError::Contract)?;
+                if certificate.encode()?.as_slice() != bytes {
+                    return Err(CoverageError::Contract);
+                }
+                // The starting root is an in-process actual closed proof,
+                // never a deserialized marker presented as a certificate.
+                let previous = certificate.previous(
+                    &recovery.cursor,
+                    &scope_digest,
+                    &scope.source_revision,
+                )?;
+                if let Err(CoverageError::Budget) = window.reserve(1, 1) {
+                    self.persist_recovery_window(
+                        &scope,
+                        target.height() as u32,
+                        current_tip,
+                        &mut window,
+                    )?;
+                    self.prefix_recovery = Some(recovery);
+                    return Ok(());
+                }
+                self.store
+                    .history_db
+                    .delete(vec![key])
+                    .map_err(|_| CoverageError::Storage)?;
+                recovery.cursor = previous;
+            }
+            if recovery.cursor.height != recovery.target_height
+                || recovery.cursor.block_hash != recovery.target_hash
+                || self
+                    .store
+                    .indexed_headers
+                    .try_read()
+                    .map_err(|_| CoverageError::Changed)?
+                    .header_by_height(recovery.target_height as usize)
+                    .map(|header| header.hash().to_string())
+                    .as_deref()
+                    != Some(&recovery.target_hash)
+            {
+                return Err(CoverageError::Changed);
+            }
+            self.verified_prefix = Some(recovery.cursor.clone());
+            let mut progress = Progress::initial(
+                scope.clone(),
+                target.height() as u32,
+                current_tip.to_string(),
+            )?;
+            progress.total_visits_atomic = self.baseline_total_visits.clone();
+            window.persist_cumulative(&mut progress)?;
+            self.baseline_total_visits = progress.total_visits_atomic.clone();
+            progress.prefix = Some(recovery.cursor);
+            progress.next_height = recovery
+                .target_height
+                .checked_add(1)
+                .ok_or(CoverageError::Overflow)?;
+            self.baseline = Some(BaselineRuntime {
+                progress,
+                header: None,
+                roster: vec![],
+                roster_seen: super::history_coverage::RosterProof::new(),
+                transaction: None,
+                edges: vec![],
+                certificates_verified: true,
+            });
+        }
+        if self.baseline.is_none() {
+            let mut state = Progress::initial(
+                scope.clone(),
+                target.height() as u32,
+                current_tip.to_string(),
+            )?;
+            // Persisted markers/progress are NOT historical proof. After a
+            // process restart revalidate from genesis; preserve cumulative
+            // reservation accounting and the previous canonical record.
+            let key = state.progress_key()?;
+            window.reserve(1, 1 + coverage::PROGRESS_BYTES / 32)?;
+            if let Some(bytes) = self
+                .store
+                .history_db
+                .qualified_get(&key, coverage::PROGRESS_BYTES)
+                .map_err(|_| CoverageError::Storage)?
+            {
+                let saved = Progress::decode(&bytes, &scope)?;
+                state.total_visits_atomic = saved.total_visits_atomic;
+                self.baseline_total_visits = state.total_visits_atomic.clone();
+            }
+            self.baseline = Some(BaselineRuntime {
+                progress: state,
+                header: None,
+                roster: vec![],
+                roster_seen: super::history_coverage::RosterProof::new(),
+                transaction: None,
+                edges: vec![],
+                certificates_verified: true,
+            });
+        }
+        let mut runtime = self.baseline.take().ok_or(CoverageError::Missing)?;
+        runtime.progress.validate(&scope)?;
+        runtime.progress.target_observed_height = target.height() as u32;
+        runtime.progress.target_observed_hash = current_tip.to_string();
+        if let Some(prefix) = &runtime.progress.prefix {
+            let actual = self
+                .store
+                .indexed_headers
+                .try_read()
+                .map_err(|_| CoverageError::Changed)?
+                .header_by_height(prefix.height as usize)
+                .map(|entry| entry.hash().to_string());
+            if actual.as_deref() != Some(&prefix.block_hash) {
+                return Err(CoverageError::Changed);
+            }
+        }
+        // Closure is assessed only after every actual block/transaction/row
+        // check, under current canonical metadata and persisted tip fence.
+        if runtime.progress.next_height > target.height() as u32 {
+            let prefix = runtime
+                .progress
+                .prefix
+                .as_ref()
+                .ok_or(CoverageError::Missing)?;
+            if !runtime.certificates_verified
+                || prefix.height != target.height() as u32
+                || prefix.block_hash != current_tip.to_string()
+            {
+                return Err(CoverageError::Changed);
+            }
+            let owner = Arc::clone(&self.store);
+            let mutation = owner.read_generation.begin();
+            if baseline_point(&self.store, b"t", 32, &mut window)? != serialize(current_tip)
+                || self
+                    .store
+                    .indexed_headers
+                    .try_read()
+                    .map_err(|_| CoverageError::Changed)?
+                    .tip()
+                    != current_tip
+            {
+                return Err(CoverageError::Changed);
+            }
+            let commitment = scope.commitment()?;
+            let proof = CompletedBaseline {
+                scope: commitment.clone(),
+                height: prefix.height,
+                hash: *current_tip,
+            };
+            mutation
+                .commit_baseline(proof, &commitment, prefix.height, current_tip)
+                .map_err(|_| CoverageError::Changed)?;
+            *self
+                .store
+                .coverage_scope
+                .write()
+                .map_err(|_| CoverageError::Changed)? = Some(commitment);
+            self.verified_prefix = Some(prefix.clone());
+            return Ok(());
+        }
+        loop {
+            let mut block_completed = false;
+            let result = (|| -> Result<(), CoverageError> {
+                match runtime.progress.phase {
+                    Phase::BlockRoster => {
+                        window.reserve(1, 1)?;
+                        let header = self
+                            .store
+                            .indexed_headers
+                            .try_read()
+                            .map_err(|_| CoverageError::Changed)?
+                            .header_by_height(runtime.progress.next_height as usize)
+                            .cloned()
+                            .ok_or(CoverageError::Missing)?;
+                        let raw = baseline_point(
+                            &self.store,
+                            &BlockRow::txids_key(full_hash(&header.hash()[..])),
+                            coverage::POINT_BYTES,
+                            &mut window,
+                        )?;
+                        // Validate all count/length bytes before Vec allocation.
+                        if raw.len() < 8 {
+                            return Err(CoverageError::Contract);
+                        }
+                        let count = u64::from_le_bytes(
+                            raw[..8].try_into().map_err(|_| CoverageError::Contract)?,
+                        );
+                        if count == 0
+                            || count > u16::MAX as u64
+                            || 8 + count * 32 != raw.len() as u64
+                        {
+                            return Err(CoverageError::Contract);
+                        }
+                        let roster: Vec<Txid> = bincode_util::deserialize_little(&raw)
+                            .map_err(|_| CoverageError::Contract)?;
+                        let meta = baseline_point(
+                            &self.store,
+                            &BlockRow::meta_key(full_hash(&header.hash()[..])),
+                            128,
+                            &mut window,
+                        )?;
+                        let meta: BlockMeta = bincode_util::deserialize_little(&meta)
+                            .map_err(|_| CoverageError::Contract)?;
+                        if meta.tx_count as usize != roster.len() || meta.weight > 4_000_000 {
+                            return Err(CoverageError::Contract);
+                        }
+                        runtime.header = Some(header);
+                        runtime.roster = roster;
+                        runtime.edges.clear();
+                        runtime.progress.transaction_position = 0;
+                        runtime.progress.item_position = 0;
+                        runtime.progress.history_digest = "0".repeat(64);
+                        runtime.progress.edges_digest = "0".repeat(64);
+                        runtime.progress.checked_funding_rows_atomic = "0".into();
+                        runtime.progress.checked_spending_rows_atomic = "0".into();
+                        runtime.progress.item_position = 0;
+                        runtime.roster_seen.clear();
+                        runtime.progress.phase = Phase::RosterValidation;
+                    }
+                    Phase::RosterValidation => {
+                        let index = runtime.progress.item_position as usize;
+                        if index < runtime.roster.len() {
+                            runtime.roster_seen.admit(
+                                runtime.roster.len(),
+                                full_hash(&runtime.roster[index][..]),
+                                &mut window,
+                            )?;
+                            runtime.progress.item_position = runtime
+                                .progress
+                                .item_position
+                                .checked_add(1)
+                                .ok_or(CoverageError::Overflow)?;
+                            return Ok(());
+                        }
+                        // Read reservation and duplicate validation were carried
+                        // by earlier windows. Hashing is separately reserved
+                        // BEFORE dispatch and fits the unchanged 1M work cap.
+                        runtime
+                            .roster_seen
+                            .reserve_hash(runtime.roster.len(), &mut window)?;
+                        let merkle = bitcoin::util::hash::bitcoin_merkle_root(
+                            runtime.roster.iter().map(|txid| {
+                                bitcoin::TxMerkleNode::from_slice(&txid[..]).expect("fixed32")
+                            }),
+                        )
+                        .ok_or(CoverageError::Contract)?;
+                        if merkle
+                            != runtime
+                                .header
+                                .as_ref()
+                                .ok_or(CoverageError::Missing)?
+                                .header()
+                                .merkle_root
+                        {
+                            return Err(CoverageError::Contract);
+                        }
+                        runtime.roster_seen.clear();
+                        runtime.progress.item_position = 0;
+                        runtime.progress.phase = Phase::Transaction;
+                    }
+                    Phase::Transaction => {
+                        let position = runtime.progress.transaction_position as usize;
+                        if position == runtime.roster.len() {
+                            runtime.progress.phase = Phase::BlockCommit;
+                            return Ok(());
+                        }
+                        let txid = runtime
+                            .roster
+                            .get(position)
+                            .ok_or(CoverageError::Contract)?;
+                        let raw = baseline_point(
+                            &self.store,
+                            &TxRow::key(&txid[..]),
+                            coverage::POINT_BYTES,
+                            &mut window,
+                        )?;
+                        let tx: Transaction =
+                            deserialize(&raw).map_err(|_| CoverageError::Contract)?;
+                        if tx.txid() != *txid || (position == 0) != tx.is_coin_base() {
+                            return Err(CoverageError::Contract);
+                        }
+                        let header = runtime.header.as_ref().ok_or(CoverageError::Missing)?;
+                        let confirmation = TxConfKey {
+                            code: b'C',
+                            txid: full_hash(&txid[..]),
+                            blockhash: full_hash(&header.hash()[..]),
+                        };
+                        let key = bincode_util::serialize_little(&confirmation)
+                            .map_err(|_| CoverageError::Contract)?;
+                        if !baseline_point(&self.store, &key, 0, &mut window)?.is_empty() {
+                            return Err(CoverageError::Contract);
+                        }
+                        runtime.transaction = Some(tx);
+                        runtime.progress.item_position = 0;
+                        runtime.progress.phase = Phase::Output;
+                    }
+                    Phase::Output => {
+                        window.reserve(1, 1)?;
+                        let tx = runtime.transaction.as_ref().ok_or(CoverageError::Missing)?;
+                        let index = runtime.progress.item_position as usize;
+                        if index == tx.output.len() {
+                            runtime.progress.phase = Phase::Input;
+                            runtime.progress.item_position = 0;
+                            return Ok(());
+                        }
+                        let output = tx.output.get(index).ok_or(CoverageError::Contract)?;
+                        if is_spendable(output) || self.iconfig.index_unspendables {
+                            let row = TxHistoryRow::new(
+                                &output.script_pubkey,
+                                runtime.progress.next_height,
+                                runtime.progress.transaction_position,
+                                TxHistoryInfo::Funding(FundingInfo {
+                                    txid: full_hash(&tx.txid()[..]),
+                                    vout: index as u32,
+                                    value: output.value,
+                                }),
+                            )
+                            .into_row();
+                            if !baseline_history_point(
+                                &self.store.history_db,
+                                &row.key,
+                                0,
+                                &mut window,
+                            )?
+                            .is_empty()
+                            {
+                                return Err(CoverageError::Contract);
+                            }
+                            runtime.progress.history_digest =
+                                digest(runtime.progress.history_digest.as_bytes(), &row.key);
+                            runtime.progress.checked_funding_rows_atomic =
+                                increment_atomic(&runtime.progress.checked_funding_rows_atomic)?;
+                        }
+                        runtime.progress.item_position = runtime
+                            .progress
+                            .item_position
+                            .checked_add(1)
+                            .ok_or(CoverageError::Overflow)?;
+                    }
+                    Phase::Input => {
+                        window.reserve(1, 1)?;
+                        let tx = runtime.transaction.as_ref().ok_or(CoverageError::Missing)?;
+                        let index = runtime.progress.item_position as usize;
+                        if index == tx.input.len() {
+                            runtime.progress.transaction_position = runtime
+                                .progress
+                                .transaction_position
+                                .checked_add(1)
+                                .ok_or(CoverageError::Overflow)?;
+                            runtime.progress.item_position = 0;
+                            runtime.progress.phase = Phase::Transaction;
+                            runtime.transaction = None;
+                            return Ok(());
+                        }
+                        let input = tx.input.get(index).ok_or(CoverageError::Contract)?;
+                        if has_prevout(input) {
+                            let raw = baseline_point(
+                                &self.store,
+                                &TxRow::key(&input.previous_output.txid[..]),
+                                coverage::POINT_BYTES,
+                                &mut window,
+                            )?;
+                            let parent: Transaction =
+                                deserialize(&raw).map_err(|_| CoverageError::Contract)?;
+                            if parent.txid() != input.previous_output.txid {
+                                return Err(CoverageError::Contract);
+                            }
+                            let previous = parent
+                                .output
+                                .get(input.previous_output.vout as usize)
+                                .ok_or(CoverageError::Contract)?;
+                            let output = baseline_point(
+                                &self.store,
+                                &TxOutRow::key(&input.previous_output),
+                                coverage::POINT_BYTES,
+                                &mut window,
+                            )?;
+                            if output != serialize(previous) {
+                                return Err(CoverageError::Contract);
+                            }
+                            // Resume the exact parent-confirmation scan across
+                            // windows. Every C/X read is reserved before IO;
+                            // no large nested vector or restart-at-zero loop.
+                            let parent_prefix = TxConfRow::filter(&input.previous_output.txid[..]);
+                            window.reserve(1, 1)?;
+                            let snapshot = self.store.txstore_db.bounded_snapshot();
+                            if let Some(record) = snapshot
+                                .next_record(
+                                    &parent_prefix,
+                                    runtime.progress.parent_after_key.as_deref(),
+                                )
+                                .map_err(|_| CoverageError::Storage)?
+                            {
+                                let confirmation: TxConfKey =
+                                    bincode_util::deserialize_little(&record.key)
+                                        .map_err(|_| CoverageError::Contract)?;
+                                if confirmation.code != b'C'
+                                    || confirmation.txid
+                                        != full_hash(&input.previous_output.txid[..])
+                                    || bincode_util::serialize_little(&confirmation)
+                                        .map_err(|_| CoverageError::Contract)?
+                                        != record.key
+                                {
+                                    return Err(CoverageError::Contract);
+                                }
+                                let hash: BlockHash = deserialize(&confirmation.blockhash)
+                                    .map_err(|_| CoverageError::Contract)?;
+                                let header = self
+                                    .store
+                                    .indexed_headers
+                                    .try_read()
+                                    .map_err(|_| CoverageError::Changed)?
+                                    .header_by_blockhash(&hash)
+                                    .cloned();
+                                if let Some(header) = header {
+                                    let raw = baseline_point(
+                                        &self.store,
+                                        &BlockRow::txids_key(full_hash(&hash[..])),
+                                        coverage::POINT_BYTES,
+                                        &mut window,
+                                    )?;
+                                    window.reserve(1, 1 + raw.len() / 16)?;
+                                    let position = super::qualified_edges::roster_position(
+                                        &raw,
+                                        full_hash(&parent.txid()[..]),
+                                    )
+                                    .map_err(|_| CoverageError::Contract)?;
+                                    // Reserve roster scan and SHA tree work before either
+                                    // operation; a point-read reservation alone is not
+                                    // a reservation for hashing all parent transactions.
+                                    let merkle = bitcoin::util::hash::bitcoin_merkle_root(
+                                        raw[8..].chunks_exact(32).map(|bytes| {
+                                            bitcoin::TxMerkleNode::from_slice(bytes)
+                                                .expect("fixed32")
+                                        }),
+                                    )
+                                    .ok_or(CoverageError::Contract)?;
+                                    if merkle != header.header().merkle_root {
+                                        return Err(CoverageError::Contract);
+                                    }
+                                    let before = header.height()
+                                        < runtime.progress.next_height as usize
+                                        || (header.height()
+                                            == runtime.progress.next_height as usize
+                                            && position < runtime.progress.transaction_position);
+                                    if before
+                                        && runtime
+                                            .progress
+                                            .parent_best_height
+                                            .map_or(true, |height| {
+                                                header.height() > height as usize
+                                            })
+                                    {
+                                        runtime.progress.parent_best_height =
+                                            Some(header.height() as u32);
+                                        runtime.progress.parent_best_hash = Some(hash.to_string());
+                                        runtime.progress.parent_best_position = Some(position);
+                                    }
+                                }
+                                runtime.progress.parent_after_key = Some(record.key);
+                                return Ok(());
+                            }
+                            let parent_height = runtime
+                                .progress
+                                .parent_best_height
+                                .ok_or(CoverageError::Missing)?;
+                            if parent_height == 0
+                                || (parent.is_coin_base()
+                                    && runtime.progress.next_height
+                                        < parent_height.saturating_add(100))
+                            {
+                                return Err(CoverageError::Contract);
+                            }
+                            let row = TxHistoryRow::new(
+                                &previous.script_pubkey,
+                                runtime.progress.next_height,
+                                runtime.progress.transaction_position,
+                                TxHistoryInfo::Spending(SpendingInfo {
+                                    txid: full_hash(&tx.txid()[..]),
+                                    vin: index as u32,
+                                    prev_txid: full_hash(&input.previous_output.txid[..]),
+                                    prev_vout: input.previous_output.vout,
+                                    value: previous.value,
+                                }),
+                            )
+                            .into_row();
+                            if !baseline_history_point(
+                                &self.store.history_db,
+                                &row.key,
+                                0,
+                                &mut window,
+                            )?
+                            .is_empty()
+                            {
+                                return Err(CoverageError::Contract);
+                            }
+                            let edge = super::qualified_edges::EdgeKey {
+                                script_hash: compute_script_hash(&previous.script_pubkey),
+                                funding_txid: full_hash(&input.previous_output.txid[..]),
+                                funding_vout: input.previous_output.vout,
+                                spending_height: runtime.progress.next_height,
+                                spending_block_hash: full_hash(
+                                    &runtime
+                                        .header
+                                        .as_ref()
+                                        .ok_or(CoverageError::Missing)?
+                                        .hash()[..],
+                                ),
+                                spending_position: runtime.progress.transaction_position,
+                                spending_txid: full_hash(&tx.txid()[..]),
+                                spending_vin: index as u32,
+                            }
+                            .encode();
+                            if (runtime.edges.len() + 1) * super::qualified_edges::EDGE_KEY_BYTES
+                                > coverage::POINT_BYTES
+                            {
+                                return Err(CoverageError::Contract);
+                            }
+                            runtime.edges.push(edge);
+                            runtime.progress.edges_digest =
+                                digest(runtime.progress.edges_digest.as_bytes(), &edge);
+                            runtime.progress.history_digest =
+                                digest(runtime.progress.history_digest.as_bytes(), &row.key);
+                            runtime.progress.checked_spending_rows_atomic =
+                                increment_atomic(&runtime.progress.checked_spending_rows_atomic)?;
+                        } else if runtime.progress.transaction_position != 0 || tx.input.len() != 1
+                        {
+                            return Err(CoverageError::Contract);
+                        }
+                        runtime.progress.parent_after_key = None;
+                        runtime.progress.parent_best_height = None;
+                        runtime.progress.parent_best_hash = None;
+                        runtime.progress.parent_best_position = None;
+                        runtime.progress.item_position = runtime
+                            .progress
+                            .item_position
+                            .checked_add(1)
+                            .ok_or(CoverageError::Overflow)?;
+                    }
+                    Phase::BlockCommit => {
+                        window.reserve(
+                            1,
+                            1 + runtime.edges.len() * super::qualified_edges::EDGE_KEY_BYTES / 32,
+                        )?;
+                        let header = runtime.header.as_ref().ok_or(CoverageError::Missing)?;
+                        let hash = header.hash().to_string();
+                        if self
+                            .store
+                            .indexed_headers
+                            .try_read()
+                            .map_err(|_| CoverageError::Changed)?
+                            .header_by_height(runtime.progress.next_height as usize)
+                            .map(|value| value.hash().to_string())
+                            .as_deref()
+                            != Some(&hash)
+                        {
+                            return Err(CoverageError::Changed);
+                        }
+                        let raw = bincode_util::serialize_little(&runtime.roster)
+                            .map_err(|_| CoverageError::Contract)?;
+                        let certificate = BlockCertificate {
+                            schema_version: "universe-electrs-history-block-coverage-v2".into(),
+                            scope_digest: scope.commitment()?,
+                            height: runtime.progress.next_height,
+                            block_hash: hash.clone(),
+                            previous_block_hash: header.header().prev_blockhash.to_string(),
+                            previous_coverage_sha256: runtime
+                                .progress
+                                .prefix
+                                .as_ref()
+                                .map(|value| value.coverage_sha256.clone())
+                                .unwrap_or_else(|| "0".repeat(64)),
+                            roster_sha256: digest(b"", &raw),
+                            roster_merkle_root: header.header().merkle_root.to_string(),
+                            transaction_count: runtime.roster.len() as u32,
+                            checked_funding_rows_atomic: runtime
+                                .progress
+                                .checked_funding_rows_atomic
+                                .clone(),
+                            checked_spending_rows_atomic: runtime
+                                .progress
+                                .checked_spending_rows_atomic
+                                .clone(),
+                            expected_history_digest: runtime.progress.history_digest.clone(),
+                            supplemental_edges_digest: runtime.progress.edges_digest.clone(),
+                            source_revision: scope.source_revision.clone(),
+                        };
+                        let bytes = certificate.encode()?;
+                        let commitment = certificate.commitment()?;
+                        let mut key = vec![0xff, b'U', b'C', 2];
+                        key.extend(decode_digest(&certificate.scope_digest)?);
+                        key.extend(certificate.height.to_be_bytes());
+                        key.extend(full_hash(&header.hash()[..]));
+                        let mut next = runtime.progress.clone();
+                        next.prefix = Some(coverage::Prefix {
+                            height: certificate.height,
+                            block_hash: hash,
+                            coverage_sha256: commitment,
+                        });
+                        next.next_height = next
+                            .next_height
+                            .checked_add(1)
+                            .ok_or(CoverageError::Overflow)?;
+                        next.phase = Phase::BlockRoster;
+                        window.persist_cumulative(&mut next)?;
+                        let mut rows: Vec<DBRow> = runtime
+                            .edges
+                            .iter()
+                            .map(|key| DBRow {
+                                key: key.to_vec(),
+                                value: vec![],
+                            })
+                            .collect();
+                        rows.push(DBRow { key, value: bytes });
+                        rows.push(DBRow {
+                            key: next.progress_key()?,
+                            value: next.encode()?,
+                        });
+                        self.store
+                            .history_db
+                            .write_coverage(rows)
+                            .map_err(|_| CoverageError::Storage)?;
+                        self.baseline_total_visits = next.total_visits_atomic.clone();
+                        runtime.progress = next;
+                        runtime.header = None;
+                        runtime.roster.clear();
+                        runtime.roster_seen.clear();
+                        runtime.transaction = None;
+                        runtime.edges.clear();
+                        // One completed block per invocation; independent next
+                        // window resets local caps, never the cumulative count.
+                        block_completed = true;
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            })();
+            if block_completed {
+                self.baseline = Some(runtime);
+                return Ok(());
+            }
+            match result {
+                Ok(()) => {}
+                Err(CoverageError::Budget) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        window.persist_cumulative(&mut runtime.progress)?;
+        self.baseline_total_visits = runtime.progress.total_visits_atomic.clone();
+        self.store
+            .history_db
+            .write_coverage(vec![DBRow {
+                key: runtime.progress.progress_key()?,
+                value: runtime.progress.encode()?,
+            }])
+            .map_err(|_| CoverageError::Storage)?;
+        self.baseline = Some(runtime);
+        Ok(())
     }
 
     fn start_timer(&self, name: &str) -> HistogramTimer {
@@ -509,7 +1503,7 @@ impl Indexer {
             } else {
                 self.store
                     .txstore_db
-                    .delete(rows.into_iter().map(|r| r.key).collect())?;
+                    .delete(self.canonical_shared_delete_keys(rows)?)?;
             }
         }
 
@@ -531,6 +1525,68 @@ impl Indexer {
             }
         }
         Ok(())
+    }
+
+    fn canonical_shared_delete_keys(&self, rows: Vec<DBRow>) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            if matches!(row.key.first(), Some(b'T') | Some(b'O')) {
+                let txid: FullHash = row
+                    .key
+                    .get(1..33)
+                    .ok_or("malformed shared transaction key")?
+                    .try_into()
+                    .map_err(|_| Error::from("malformed shared transaction key"))?;
+                if self.has_canonical_confirmation(&txid)? {
+                    continue;
+                }
+            }
+            keys.push(row.key);
+        }
+        Ok(keys)
+    }
+    fn has_canonical_confirmation(&self, txid: &FullHash) -> Result<bool> {
+        // Exact full-key continuation, bounded retained state. Each window
+        // processes at most500 records; the same owned critical operation
+        // resumes at its cursor rather than restarting or admitting a writer.
+        let prefix = TxConfRow::filter(txid);
+        let mut after = None;
+        loop {
+            for _ in 0..super::qualified_edges::MAX_VISITS {
+                let record = self
+                    .store
+                    .txstore_db
+                    .next_empty_record(&prefix, after.as_deref())?;
+                let record = match record {
+                    Some(record) => record,
+                    None => return Ok(false),
+                };
+                let conf: TxConfKey = bincode_util::deserialize_little(&record.key)
+                    .chain_err(|| "invalid confirmation key")?;
+                if conf.code != b'C'
+                    || &conf.txid != txid
+                    || bincode_util::serialize_little(&conf)
+                        .chain_err(|| "invalid confirmation key")?
+                        != record.key
+                {
+                    bail!("invalid confirmation key");
+                }
+                after = Some(record.key);
+                let hash: BlockHash =
+                    deserialize(&conf.blockhash).chain_err(|| "invalid confirmation hash")?;
+                if self
+                    .store
+                    .indexed_headers
+                    .try_read()
+                    .map_err(|_| Error::from("canonical headers busy"))?
+                    .header_by_blockhash(&hash)
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn index(&self, blocks: &[BlockEntry], op: Operation) -> Result<()> {
@@ -558,7 +1614,7 @@ impl Indexer {
                     }
                 }
             }
-            index_blocks(blocks, &previous_txos_map, &self.iconfig, &op)
+            index_blocks(blocks, &previous_txos_map, &self.iconfig, &op)?
         };
         if let Operation::AddBlocks = op {
             self.store.history_db.write(rows, self.flush);
@@ -576,7 +1632,15 @@ impl Indexer {
             super::db::delete_cache_chunks(keys, |keys| self.store.cache_db.delete(keys))?;
             self.store
                 .history_db
-                .delete(rows.into_iter().map(|r| r.key).collect())?;
+                // Legacy S candidates lack containing-block identity. An
+                // orphan occurrence must not erase an identical ancestor key.
+                // Canonical confirmation/order proof filters retained reads.
+                .delete(
+                    rows.into_iter()
+                        .filter(|row| row.key.first() != Some(&b'S'))
+                        .map(|r| r.key)
+                        .collect(),
+                )?;
         }
         // Keep the existing marker filter consistent with the completed DB
         // batch, including a removed fork that later becomes current again.
@@ -685,13 +1749,67 @@ impl UpdateWriter<HeaderEntry, BlockHash> for IndexerReadWriter<'_> {
                 return Ok(());
             }
         }
-        if !plan.reorged.is_empty() {
-            // INTERIM fail closed: delete logs/discards individual DB errors;
-            // marker absence is not original-key deletion completeness. Exact
-            // immutable deletion replay proof remains a source-only prerequisite.
-            self.qualified = false;
-            warn!("paged reorg cleanup proof unavailable; legacy producer continues");
-            return Ok(());
+        #[cfg(not(feature = "liquid"))]
+        if let Some(prefix) = self.indexer.verified_prefix.clone() {
+            if !plan.reorged.is_empty() {
+                let rollback = plan.rollback_tip.and_then(|hash| {
+                    store
+                        .indexed_headers
+                        .try_read()
+                        .ok()?
+                        .header_by_blockhash(&hash)
+                        .cloned()
+                });
+                if let Some(rollback) = rollback {
+                    self.indexer.prefix_recovery = Some(PrefixRecovery {
+                        cursor: prefix,
+                        target_height: rollback.height() as u32,
+                        target_hash: rollback.hash().to_string(),
+                    });
+                    self.indexer.baseline = None;
+                } else {
+                    self.indexer.verified_prefix = None;
+                    self.indexer.baseline = None;
+                }
+                self.qualified = false;
+            } else if !plan.headers.is_empty() {
+                // Continue coverage only for the new canonical suffix; the
+                // previously closed prefix was actually verified in-process.
+                let scope = self.indexer.baseline_scope(self.daemon);
+                if let Ok(scope) = scope {
+                    let target_height = store.indexed_headers.try_read().ok().and_then(|headers| {
+                        headers
+                            .header_by_blockhash(&plan.target)
+                            .map(|header| header.height() as u32)
+                    });
+                    if let Some(height) = target_height {
+                        let mut progress = super::history_coverage::Progress::initial(
+                            scope,
+                            height,
+                            plan.target.to_string(),
+                        )
+                        .map_err(|_| Error::from("coverage scope unavailable"))?;
+                        progress.total_visits_atomic = self.indexer.baseline_total_visits.clone();
+                        progress.next_height = prefix
+                            .height
+                            .checked_add(1)
+                            .ok_or("coverage height overflow")?;
+                        progress.prefix = Some(prefix);
+                        self.indexer.baseline = Some(BaselineRuntime {
+                            progress,
+                            header: None,
+                            roster: vec![],
+                            roster_seen: super::history_coverage::RosterProof::new(),
+                            transaction: None,
+                            edges: vec![],
+                            certificates_verified: true,
+                        });
+                        self.qualified = false;
+                    }
+                } else {
+                    self.qualified = false;
+                }
+            }
         }
         Ok(())
     }
@@ -702,11 +1820,37 @@ pub struct PagedChainSnapshot<'a> {
     chain: &'a ChainQuery,
     history: super::db::BoundedSnapshot<'a>,
     txstore: super::db::BoundedSnapshot<'a>,
+    proof_txstore: Option<super::db::BoundedSnapshot<'a>>,
     epoch: u64,
     script_hash: FullHash,
 }
 #[cfg(not(feature = "liquid"))]
 impl PagedChainSnapshot<'_> {
+    fn point_value(
+        &self,
+        key: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Bytes>, super::paged_outputs::PageError> {
+        match self.txstore.point_value(key, maximum)? {
+            Some(value) => Ok(Some(value)),
+            None => {
+                if matches!(key.first(), Some(b'T') | Some(b'X') | Some(b'M')) {
+                    if let Some(proof) = &self.proof_txstore {
+                        return proof.point_value(key, maximum);
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+    pub fn operation_work(&self, operation: super::paged_outputs::ReadOperation) -> usize {
+        use super::paged_outputs::ReadOperation;
+        let body = if self.proof_txstore.is_some() { 2 } else { 1 };
+        match operation {
+            ReadOperation::History | ReadOperation::Spend => 1 + 2 * body,
+            _ => 1,
+        }
+    }
     pub fn valid(&self) -> Result<(), super::paged_outputs::PageError> {
         if self.chain.matches_read_generation(self.epoch) {
             Ok(())
@@ -733,18 +1877,67 @@ impl PagedChainSnapshot<'_> {
         {
             return Err(PageError::Contract);
         }
-        let funding = match decoded.txinfo {
-            TxHistoryInfo::Funding(value) => Some(Funding {
-                txid: deserialize(&value.txid).map_err(|_| PageError::Contract)?,
-                vout: value.vout,
-                value: value.value,
-                height: decoded.confirmed_height,
-            }),
+        let funding = match &decoded.txinfo {
+            TxHistoryInfo::Funding(value) => {
+                let raw = self
+                    .point_value(&TxRow::key(&value.txid), 4 * 1024 * 1024)?
+                    .ok_or(PageError::Unavailable)?;
+                let tx: Transaction = deserialize(&raw).map_err(|_| PageError::Contract)?;
+                if full_hash(&tx.txid()[..]) != value.txid {
+                    return Err(PageError::Contract);
+                }
+                let output = tx
+                    .output
+                    .get(value.vout as usize)
+                    .ok_or(PageError::Contract)?;
+                if output.value != value.value
+                    || compute_script_hash(&output.script_pubkey) != self.script_hash
+                {
+                    return Err(PageError::Contract);
+                }
+                let header = self
+                    .chain
+                    .store
+                    .indexed_headers
+                    .try_read()
+                    .map_err(|_| PageError::Unavailable)?
+                    .header_by_height(decoded.confirmed_height as usize)
+                    .cloned();
+                match header {
+                    Some(header) => {
+                        let roster = self
+                            .point_value(
+                                &BlockRow::txids_key(full_hash(&header.hash()[..])),
+                                4 * 1024 * 1024,
+                            )?
+                            .ok_or(PageError::Unavailable)?;
+                        let position = super::qualified_edges::roster_position(&roster, value.txid);
+                        match position {
+                            Ok(position)
+                                if position == decoded.tx_position
+                                    && decoded.confirmed_height != 0
+                                    && is_spendable(output) =>
+                            {
+                                Some(Funding {
+                                    txid: tx.txid(),
+                                    vout: value.vout,
+                                    value: value.value,
+                                    height: decoded.confirmed_height,
+                                })
+                            }
+                            Err(super::qualified_edges::EdgeError::MissingCoverage) | Ok(_) => None,
+                            Err(_) => return Err(PageError::Contract),
+                        }
+                    }
+                    None => None,
+                }
+            }
             TxHistoryInfo::Spending(_) => None,
         };
         Ok(Some(HistoryRecord {
             key: row.key,
             funding,
+            position: decoded.tx_position,
         }))
     }
     pub fn confirmation(
@@ -790,23 +1983,67 @@ impl PagedChainSnapshot<'_> {
         after: Option<&[u8]>,
     ) -> Result<Option<super::paged_outputs::SpendRecord>, super::paged_outputs::PageError> {
         use super::paged_outputs::{PageError, SpendRecord};
+        use super::qualified_edges::EdgeKey;
         self.valid()?;
-        let row = match self.history.next_record(&TxEdgeRow::filter(point), after)? {
+        let prefix = EdgeKey::prefix(self.script_hash, full_hash(&point.txid[..]), point.vout);
+        let row = match self.history.next_record(&prefix, after)? {
             Some(row) => row,
             None => return Ok(None),
         };
-        let decoded: TxEdgeKey =
-            bincode_util::deserialize_little(&row.key).map_err(|_| PageError::Contract)?;
-        if decoded.code != b'S'
-            || decoded.funding_txid != full_hash(&point.txid[..])
-            || decoded.funding_vout != point.vout
-            || bincode_util::serialize_little(&decoded).map_err(|_| PageError::Contract)? != row.key
+        let edge = EdgeKey::decode(&row.key).map_err(|_| PageError::Contract)?;
+        if edge.encode().as_slice() != row.key.as_slice() || edge.outpoint_prefix() != prefix {
+            return Err(PageError::Contract);
+        }
+        let hash: BlockHash =
+            deserialize(&edge.spending_block_hash).map_err(|_| PageError::Contract)?;
+        let canonical = {
+            let headers = self
+                .chain
+                .store
+                .indexed_headers
+                .try_read()
+                .map_err(|_| PageError::Unavailable)?;
+            headers.header_by_blockhash(&hash).map(BlockId::from)
+        };
+        if canonical
+            .as_ref()
+            .map_or(false, |block| block.height != edge.spending_height as usize)
         {
             return Err(PageError::Contract);
         }
+        let txid: Txid = deserialize(&edge.spending_txid).map_err(|_| PageError::Contract)?;
+        if let Some(block) = &canonical {
+            let raw = self
+                .point_value(&TxRow::key(&edge.spending_txid), 4 * 1024 * 1024)?
+                .ok_or(PageError::Unavailable)?;
+            let tx: Transaction = deserialize(&raw).map_err(|_| PageError::Contract)?;
+            if tx.txid() != txid
+                || tx
+                    .input
+                    .get(edge.spending_vin as usize)
+                    .map(|input| input.previous_output)
+                    != Some(*point)
+            {
+                return Err(PageError::Contract);
+            }
+            let roster = self
+                .point_value(
+                    &BlockRow::txids_key(full_hash(&block.hash[..])),
+                    4 * 1024 * 1024,
+                )?
+                .ok_or(PageError::Unavailable)?;
+            if super::qualified_edges::roster_position(&roster, edge.spending_txid)
+                .map_err(|_| PageError::Contract)?
+                != edge.spending_position
+            {
+                return Err(PageError::Contract);
+            }
+        }
         Ok(Some(SpendRecord {
             key: row.key,
-            txid: deserialize(&decoded.spending_txid).map_err(|_| PageError::Contract)?,
+            txid,
+            canonical,
+            position: edge.spending_position,
         }))
     }
 }
@@ -865,6 +2102,11 @@ impl ChainQuery {
             chain: self,
             history: self.store.history_db.bounded_snapshot(),
             txstore: self.store.txstore_db.bounded_snapshot(),
+            proof_txstore: self
+                .store
+                .proof_txstore
+                .as_ref()
+                .map(|store| store.bounded_snapshot()),
             epoch,
             script_hash,
         };
@@ -996,10 +2238,14 @@ impl ChainQuery {
     }
 
     pub fn completed_read_generation(&self) -> Option<u64> {
+        #[cfg(not(feature = "liquid"))]
+        if !self.store.coverage_scope.try_read().ok()?.is_some() {
+            return None;
+        }
         self.store.read_generation.completed()
     }
     pub fn matches_read_generation(&self, generation: u64) -> bool {
-        self.store.read_generation.matches(generation)
+        self.completed_read_generation() == Some(generation)
     }
 
     pub fn history_iter_scan(
@@ -1012,6 +2258,63 @@ impl ChainQuery {
             &TxHistoryRow::filter(code, hash),
             &TxHistoryRow::prefix_height(code, hash, start_height as u32),
         )
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn checked_history_iter<'a>(
+        &'a self,
+        hash: &'a [u8],
+        start_height: usize,
+        budget: &'a super::qualified_edges::ReadBudget,
+    ) -> impl Iterator<Item = Result<TxHistoryRow>> + 'a {
+        let snapshot = self.store.history_db.bounded_snapshot();
+        let prefix = TxHistoryRow::filter(b'H', hash);
+        let mut after = u32::try_from(start_height)
+            .ok()
+            .map(|height| TxHistoryRow::prefix_height(b'H', hash, height));
+        let mut terminal = false;
+        std::iter::from_fn(move || {
+            if terminal {
+                return None;
+            }
+            let read = (|| -> Result<Option<TxHistoryRow>> {
+                if after.is_none() {
+                    bail!(ErrorKind::LegacyPositionUnavailable);
+                }
+                budget
+                    .reserve(1)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                let row = match snapshot
+                    .next_record(&prefix, after.as_deref())
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                {
+                    Some(row) => row,
+                    None => return Ok(None),
+                };
+                let key: TxHistoryKey = bincode_util::deserialize_big(&row.key)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                if key.code != b'H'
+                    || key.hash.as_slice() != hash
+                    || bincode_util::serialize_big(&key)
+                        .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                        != row.key
+                {
+                    bail!(ErrorKind::LegacyPositionUnavailable);
+                }
+                after = Some(row.key);
+                Ok(Some(TxHistoryRow { key }))
+            })();
+            match read {
+                Ok(Some(row)) => Some(Ok(row)),
+                Ok(None) => {
+                    terminal = true;
+                    None
+                }
+                Err(error) => {
+                    terminal = true;
+                    Some(Err(error))
+                }
+            }
+        })
     }
     fn history_iter_scan_reverse(
         &self,
@@ -1307,10 +2610,15 @@ impl ChainQuery {
 
     // TODO: avoid duplication with stats/stats_delta?
     pub fn utxo(&self, scripthash: &[u8], limit: usize, flush: DBFlush) -> Result<Vec<Utxo>> {
+        #[cfg(not(feature = "liquid"))]
+        let epoch = self
+            .completed_read_generation()
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
         let _timer = self.start_timer("utxo");
 
         // get the last known utxo set and the blockhash it was updated for.
         // invalidates the cache if the block was orphaned.
+        #[cfg(feature = "liquid")]
         let cache: Option<(UtxoMap, usize)> = self
             .store
             .cache_db
@@ -1321,6 +2629,27 @@ impl ChainQuery {
                     .map(|height| (utxos_cache, height))
             })
             .map(|(utxos_cache, height)| (from_utxo_cache(utxos_cache, self), height));
+        #[cfg(not(feature = "liquid"))]
+        let cache: Option<(UtxoMap, usize)> =
+            match self.ledger_cache::<Vec<((Txid, u32), (u32, Value))>>(scripthash, b'U')? {
+                Some((rows, hash)) => {
+                    let mut value = CachedUtxoMap::new();
+                    for (outpoint, output) in rows {
+                        if value.insert(outpoint, output).is_some() {
+                            bail!(ErrorKind::LegacyPositionUnavailable);
+                        }
+                    }
+                    self.height_by_hash(&hash)
+                        .map(|height| (from_utxo_cache(value, self), height))
+                }
+                None => None,
+            };
+        if cache
+            .as_ref()
+            .map_or(false, |(utxos, _)| utxos.len() > limit)
+        {
+            bail!(ErrorKind::TooManyUtxos(limit));
+        }
         let had_cache = cache.is_some();
 
         // update utxo set with new transactions since
@@ -1329,16 +2658,35 @@ impl ChainQuery {
             |(oldutxos, blockheight)| self.utxo_delta(scripthash, oldutxos, blockheight + 1, limit),
         )?;
 
+        #[cfg(not(feature = "liquid"))]
+        if !self.matches_read_generation(epoch) {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
         // save updated utxo set to cache
         if let Some(lastblock) = lastblock {
             if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
+                #[cfg(feature = "liquid")]
                 self.store.cache_db.write(
                     vec![UtxoCacheRow::new(scripthash, &newutxos, &lastblock).into_row()],
+                    flush,
+                );
+                #[cfg(not(feature = "liquid"))]
+                self.store.cache_db.write(
+                    vec![self.ledger_cache_row(
+                        scripthash,
+                        b'U',
+                        make_utxo_cache(&newutxos).into_iter().collect::<Vec<_>>(),
+                        lastblock,
+                    )?],
                     flush,
                 );
             }
         }
 
+        #[cfg(not(feature = "liquid"))]
+        if !self.matches_read_generation(epoch) {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
         // format as Utxo objects
         Ok(newutxos
             .into_iter()
@@ -1374,22 +2722,29 @@ impl ChainQuery {
         limit: usize,
     ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
         let _timer = self.start_timer("utxo_delta");
+        let budget = super::qualified_edges::ReadBudget::new();
+        #[cfg(not(feature = "liquid"))]
+        let history_iter = self.checked_history_iter(scripthash, start_height, &budget);
+        #[cfg(feature = "liquid")]
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
-            .map(TxHistoryRow::from_row)
-            .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    // drop history entries that were previously confirmed in a re-orged block and later
-                    // confirmed again at a different height
-                    .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
-                    .map(|b| (history, b))
-            });
-
+            .map(|row| Ok::<_, Error>(TxHistoryRow::from_row(row)));
         let mut utxos = init_utxos;
         let mut processed_items = 0;
         let mut lastblock = None;
 
-        for (history, blockid) in history_iter {
+        for history in history_iter {
+            let history = history?;
+            let blockid = match self.current_history_occurrence(&history, &budget)? {
+                Some(block) => block,
+                None => continue,
+            };
+            // The genesis coinbase is indexed history, never a spendable UTXO.
+            #[cfg(not(feature = "liquid"))]
+            if history.key.confirmed_height == 0 {
+                continue;
+            }
+
             processed_items += 1;
             lastblock = Some(blockid.hash);
 
@@ -1414,11 +2769,16 @@ impl ChainQuery {
         Ok((utxos, lastblock, processed_items))
     }
 
-    pub fn stats(&self, scripthash: &[u8], flush: DBFlush) -> ScriptStats {
+    pub fn stats(&self, scripthash: &[u8], flush: DBFlush) -> Result<ScriptStats> {
+        #[cfg(not(feature = "liquid"))]
+        let epoch = self
+            .completed_read_generation()
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
         let _timer = self.start_timer("stats");
 
         // get the last known stats and the blockhash they are updated for.
         // invalidates the cache if the block was orphaned or if values are out of sync.
+        #[cfg(feature = "liquid")]
         let cache: Option<(ScriptStats, usize)> = self
             .store
             .cache_db
@@ -1431,23 +2791,43 @@ impl ChainQuery {
                     .map(|height| (stats, height))
             });
 
+        #[cfg(not(feature = "liquid"))]
+        let cache: Option<(ScriptStats, usize)> = self
+            .ledger_cache::<ScriptStats>(scripthash, b'A')?
+            .filter(|(value, _)| value.is_sane())
+            .and_then(|(value, hash)| self.height_by_hash(&hash).map(|height| (value, height)));
+
         // update stats with new transactions since
         let (newstats, lastblock) = cache.map_or_else(
             || self.stats_delta(scripthash, ScriptStats::default(), 0),
             |(oldstats, blockheight)| self.stats_delta(scripthash, oldstats, blockheight + 1),
-        );
+        )?;
 
+        #[cfg(not(feature = "liquid"))]
+        if !self.matches_read_generation(epoch) {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
         // save updated stats to cache
         if let Some(lastblock) = lastblock {
             if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
+                #[cfg(feature = "liquid")]
                 self.store.cache_db.write(
                     vec![StatsCacheRow::new(scripthash, &newstats, &lastblock).into_row()],
+                    flush,
+                );
+                #[cfg(not(feature = "liquid"))]
+                self.store.cache_db.write(
+                    vec![self.ledger_cache_row(scripthash, b'A', &newstats, lastblock)?],
                     flush,
                 );
             }
         }
 
-        newstats
+        #[cfg(not(feature = "liquid"))]
+        if !self.matches_read_generation(epoch) {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        Ok(newstats)
     }
 
     fn stats_delta(
@@ -1455,53 +2835,80 @@ impl ChainQuery {
         scripthash: &[u8],
         init_stats: ScriptStats,
         start_height: usize,
-    ) -> (ScriptStats, Option<BlockHash>) {
+    ) -> Result<(ScriptStats, Option<BlockHash>)> {
         let _timer = self.start_timer("stats_delta"); // TODO: measure also the number of txns processed.
+        let budget = super::qualified_edges::ReadBudget::new();
+        #[cfg(not(feature = "liquid"))]
+        let history_iter = self.checked_history_iter(scripthash, start_height, &budget);
+        #[cfg(feature = "liquid")]
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
-            .map(TxHistoryRow::from_row)
-            .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    // drop history entries that were previously confirmed in a re-orged block and later
-                    // confirmed again at a different height
-                    .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
-                    .map(|blockid| (history, blockid))
-            });
-
+            .map(|row| Ok::<_, Error>(TxHistoryRow::from_row(row)));
         let mut stats = init_stats;
         let mut seen_txids = HashSet::new();
         let mut lastblock = None;
 
-        for (history, blockid) in history_iter {
+        for history in history_iter {
+            let history = history?;
+            let blockid = match self.current_history_occurrence(&history, &budget)? {
+                Some(block) => block,
+                None => continue,
+            };
+            #[cfg(not(feature = "liquid"))]
+            if history.key.confirmed_height == 0 {
+                continue;
+            }
+
             if lastblock != Some(blockid.hash) {
                 seen_txids.clear();
             }
 
             if seen_txids.insert(history.get_txid()) {
-                stats.tx_count += 1;
+                stats.tx_count = stats
+                    .tx_count
+                    .checked_add(1)
+                    .ok_or(ErrorKind::LegacyPositionUnavailable)?;
             }
 
             match history.key.txinfo {
                 #[cfg(not(feature = "liquid"))]
                 TxHistoryInfo::Funding(ref info) => {
-                    stats.funded_txo_count += 1;
-                    stats.funded_txo_sum += info.value;
+                    stats.funded_txo_count = stats
+                        .funded_txo_count
+                        .checked_add(1)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+                    stats.funded_txo_sum = stats
+                        .funded_txo_sum
+                        .checked_add(info.value)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                 }
 
                 #[cfg(not(feature = "liquid"))]
                 TxHistoryInfo::Spending(ref info) => {
-                    stats.spent_txo_count += 1;
-                    stats.spent_txo_sum += info.value;
+                    stats.spent_txo_count = stats
+                        .spent_txo_count
+                        .checked_add(1)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+                    stats.spent_txo_sum = stats
+                        .spent_txo_sum
+                        .checked_add(info.value)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                 }
 
                 #[cfg(feature = "liquid")]
                 TxHistoryInfo::Funding(_) => {
-                    stats.funded_txo_count += 1;
+                    stats.funded_txo_count = stats
+                        .funded_txo_count
+                        .checked_add(1)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                 }
 
                 #[cfg(feature = "liquid")]
                 TxHistoryInfo::Spending(_) => {
-                    stats.spent_txo_count += 1;
+                    stats.spent_txo_count = stats
+                        .spent_txo_count
+                        .checked_add(1)
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
                 }
 
                 #[cfg(feature = "liquid")]
@@ -1514,7 +2921,195 @@ impl ChainQuery {
             lastblock = Some(blockid.hash);
         }
 
-        (stats, lastblock)
+        Ok((stats, lastblock))
+    }
+
+    fn current_history_occurrence(
+        &self,
+        history: &TxHistoryRow,
+        budget: &super::qualified_edges::ReadBudget,
+    ) -> Result<Option<BlockId>> {
+        #[cfg(feature = "liquid")]
+        {
+            let _ = budget;
+            return Ok(self
+                .tx_confirming_block(&history.get_txid())
+                .filter(|block| block.height == history.key.confirmed_height as usize));
+        }
+        #[cfg(not(feature = "liquid"))]
+        {
+            let block = match self.blockid_by_height(history.key.confirmed_height as usize) {
+                Some(block) => block,
+                None => return Ok(None),
+            };
+            let txid = history.get_txid();
+            let raw = self
+                .checked_proof_point(
+                    budget,
+                    &BlockRow::txids_key(full_hash(&block.hash[..])),
+                    4 * 1024 * 1024,
+                )
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+            let position = match super::qualified_edges::roster_position(&raw, full_hash(&txid[..]))
+            {
+                Ok(position) => position,
+                Err(super::qualified_edges::EdgeError::MissingCoverage) => return Ok(None),
+                Err(_) => bail!(ErrorKind::LegacyPositionUnavailable),
+            };
+            if position != history.key.tx_position {
+                return Ok(None);
+            }
+            self.tx_position_in_block(&txid, &block, budget)?;
+            self.validate_history_body(history, budget)?;
+            Ok(Some(block))
+        }
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn validate_history_body(
+        &self,
+        history: &TxHistoryRow,
+        budget: &super::qualified_edges::ReadBudget,
+    ) -> Result<()> {
+        let raw = self
+            .checked_proof_point(
+                budget,
+                &TxRow::key(&history.get_txid()[..]),
+                4 * 1024 * 1024,
+            )
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+        let tx: Transaction =
+            deserialize(&raw).map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+        if tx.txid() != history.get_txid() {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        let (output, value) = match &history.key.txinfo {
+            TxHistoryInfo::Funding(info) => (
+                tx.output
+                    .get(info.vout as usize)
+                    .cloned()
+                    .ok_or(ErrorKind::LegacyPositionUnavailable)?,
+                info.value,
+            ),
+            TxHistoryInfo::Spending(info) => {
+                let input = tx
+                    .input
+                    .get(info.vin as usize)
+                    .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+                if full_hash(&input.previous_output.txid[..]) != info.prev_txid
+                    || input.previous_output.vout != info.prev_vout
+                {
+                    bail!(ErrorKind::LegacyPositionUnavailable);
+                }
+                let raw = self
+                    .checked_proof_point(budget, &TxRow::key(&info.prev_txid), 4 * 1024 * 1024)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                    .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+                let parent: Transaction = deserialize(&raw)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                if full_hash(&parent.txid()[..]) != info.prev_txid {
+                    bail!(ErrorKind::LegacyPositionUnavailable);
+                }
+                (
+                    parent
+                        .output
+                        .get(info.prev_vout as usize)
+                        .cloned()
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?,
+                    info.value,
+                )
+            }
+        };
+        if output.value != value || compute_script_hash(&output.script_pubkey) != history.key.hash {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn checked_proof_point(
+        &self,
+        budget: &super::qualified_edges::ReadBudget,
+        key: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Bytes>, super::qualification::QualifiedReadError> {
+        let reads = if self.store.proof_txstore.is_some()
+            && matches!(key.first(), Some(b'T') | Some(b'X') | Some(b'M'))
+        {
+            2
+        } else {
+            1
+        };
+        budget
+            .reserve(reads)
+            .map_err(|_| super::qualification::QualifiedReadError::Contract)?;
+        self.store.proof_point(key, maximum)
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn ledger_scope(&self) -> Result<String> {
+        self.completed_read_generation()
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+        self.store
+            .coverage_scope
+            .try_read()
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+            .clone()
+            .ok_or_else(|| ErrorKind::LegacyPositionUnavailable.into())
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn ledger_cache<T: serde::de::DeserializeOwned>(
+        &self,
+        script: &[u8],
+        kind: u8,
+    ) -> Result<Option<(T, BlockHash)>> {
+        let scope = self.ledger_scope()?;
+        let key = ledger_cache_key(kind, script);
+        let bytes = match self
+            .store
+            .cache_db
+            .qualified_get(&key, 4 * 1024 * 1024)
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+        {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let entry: LedgerCache<T> = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+        if entry.schema_version != 2
+            || entry.scope_digest != scope
+            || entry.computation_version != "funding-incarnation-position-v2"
+        {
+            return Ok(None);
+        }
+        if self.blockid_by_hash(&entry.block_hash).is_none() {
+            return Ok(None);
+        }
+        Ok(Some((entry.payload, entry.block_hash)))
+    }
+    #[cfg(not(feature = "liquid"))]
+    fn ledger_cache_row<T: serde::Serialize>(
+        &self,
+        script: &[u8],
+        kind: u8,
+        payload: T,
+        block_hash: BlockHash,
+    ) -> Result<DBRow> {
+        let entry = LedgerCache {
+            schema_version: 2,
+            scope_digest: self.ledger_scope()?,
+            computation_version: "funding-incarnation-position-v2".into(),
+            block_hash,
+            payload,
+        };
+        let value = serde_json::to_vec(&entry)
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+        if value.len() > 4 * 1024 * 1024 {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        Ok(DBRow {
+            key: ledger_cache_key(kind, script),
+            value,
+        })
     }
 
     pub fn address_search(&self, prefix: &str, limit: usize) -> Vec<String> {
@@ -1664,20 +3259,224 @@ impl ChainQuery {
         lookup_txos(&self.store.txstore_db, outpoints, true)
     }
 
-    pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
-        let _timer = self.start_timer("lookup_spend");
-        self.store
-            .history_db
-            .iter_scan(&TxEdgeRow::filter(outpoint))
-            .map(TxEdgeRow::from_row)
-            .find_map(|edge| {
-                let txid: Txid = deserialize(&edge.key.spending_txid).unwrap();
-                self.tx_confirming_block(&txid).map(|b| SpendingInput {
-                    txid,
-                    vin: edge.key.spending_vin,
-                    confirmed: Some(b),
-                })
-            })
+    pub fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingInput>> {
+        self.lookup_spend_with_budget(outpoint, &super::qualified_edges::ReadBudget::new())
+    }
+    pub fn lookup_spend_with_budget(
+        &self,
+        outpoint: &OutPoint,
+        budget: &super::qualified_edges::ReadBudget,
+    ) -> Result<Option<SpendingInput>> {
+        #[cfg(feature = "liquid")]
+        {
+            let _ = budget;
+            return Ok(self
+                .store
+                .history_db
+                .iter_scan(&TxEdgeRow::filter(outpoint))
+                .map(TxEdgeRow::from_row)
+                .find_map(|edge| {
+                    let txid: Txid = deserialize(&edge.key.spending_txid).unwrap();
+                    self.tx_confirming_block(&txid).map(|block| SpendingInput {
+                        txid,
+                        vin: edge.key.spending_vin,
+                        confirmed: Some(block),
+                    })
+                }));
+        }
+        #[cfg(not(feature = "liquid"))]
+        {
+            // Absence is meaningful only after actual historical coverage. A
+            // partial future edge index/old shared S key may not say unspent.
+            let epoch = self
+                .completed_read_generation()
+                .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+            let (funding_block, funding_position) =
+                match self.canonical_tx_position(&outpoint.txid, budget)? {
+                    Some(value) => value,
+                    None => return Ok(None),
+                };
+            let raw = self
+                .checked_proof_point(budget, &TxRow::key(&outpoint.txid[..]), 4 * 1024 * 1024)
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+            let transaction: Transaction =
+                deserialize(&raw).map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+            if transaction.txid() != outpoint.txid {
+                bail!(ErrorKind::LegacyPositionUnavailable);
+            }
+            let output = transaction
+                .output
+                .get(outpoint.vout as usize)
+                .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+            let script_hash = compute_script_hash(&output.script_pubkey);
+            let snapshot = self.store.history_db.bounded_snapshot();
+            let prefix = super::qualified_edges::EdgeKey::prefix(
+                script_hash,
+                full_hash(&outpoint.txid[..]),
+                outpoint.vout,
+            );
+            let mut after = None;
+            for _ in 0..super::qualified_edges::MAX_VISITS {
+                budget
+                    .reserve(1)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                let row = snapshot
+                    .next_record(&prefix, after.as_deref())
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                let row = match row {
+                    Some(row) => row,
+                    None => {
+                        if !self.matches_read_generation(epoch) {
+                            bail!(ErrorKind::LegacyPositionUnavailable);
+                        }
+                        return Ok(None);
+                    }
+                };
+                let edge = super::qualified_edges::EdgeKey::decode(&row.key)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                after = Some(row.key);
+                let hash: BlockHash = deserialize(&edge.spending_block_hash)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                let canonical = self.blockid_by_hash(&hash);
+                if let Some(block) = canonical {
+                    if block.height != edge.spending_height as usize {
+                        bail!(ErrorKind::LegacyPositionUnavailable);
+                    }
+                    if !edge.follows_funding(funding_block.height as u32, funding_position) {
+                        continue;
+                    }
+                    let txid: Txid = deserialize(&edge.spending_txid)
+                        .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                    let actual = self.tx_position_in_block(&txid, &block, budget)?;
+                    if actual != edge.spending_position {
+                        bail!(ErrorKind::LegacyPositionUnavailable);
+                    }
+                    let raw = self
+                        .checked_proof_point(budget, &TxRow::key(&txid[..]), 4 * 1024 * 1024)
+                        .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                        .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+                    let spending: Transaction = deserialize(&raw)
+                        .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+                    if spending.txid() != txid
+                        || spending
+                            .input
+                            .get(edge.spending_vin as usize)
+                            .map(|input| input.previous_output)
+                            != Some(*outpoint)
+                        || !self.matches_read_generation(epoch)
+                    {
+                        bail!(ErrorKind::LegacyPositionUnavailable);
+                    }
+                    return Ok(Some(SpendingInput {
+                        txid,
+                        vin: edge.spending_vin,
+                        confirmed: Some(block),
+                    }));
+                }
+            }
+            bail!(ErrorKind::LegacyPositionUnavailable)
+        }
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    fn canonical_tx_position(
+        &self,
+        txid: &Txid,
+        budget: &super::qualified_edges::ReadBudget,
+    ) -> Result<Option<(BlockId, u16)>> {
+        let snapshot = self.store.txstore_db.bounded_snapshot();
+        let prefix = TxConfRow::filter(&txid[..]);
+        let mut after = None;
+        let mut latest: Option<BlockId> = None;
+        for _ in 0..super::qualified_edges::MAX_VISITS {
+            budget
+                .reserve(1)
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+            let row = snapshot
+                .next_record(&prefix, after.as_deref())
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+            let row = match row {
+                Some(row) => row,
+                None => {
+                    return match latest {
+                        Some(block) => {
+                            let position = self.tx_position_in_block(txid, &block, budget)?;
+                            Ok(Some((block, position)))
+                        }
+                        None => Ok(None),
+                    }
+                }
+            };
+            let decoded: TxConfKey = bincode_util::deserialize_little(&row.key)
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+            if decoded.code != b'C'
+                || decoded.txid != full_hash(&txid[..])
+                || bincode_util::serialize_little(&decoded)
+                    .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+                    != row.key
+            {
+                bail!(ErrorKind::LegacyPositionUnavailable);
+            }
+            after = Some(row.key);
+            let hash: BlockHash = deserialize(&decoded.blockhash)
+                .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+            if let Some(block) = self.blockid_by_hash(&hash) {
+                if latest
+                    .as_ref()
+                    .map_or(true, |previous| block.height > previous.height)
+                {
+                    latest = Some(block);
+                }
+            }
+        }
+        bail!(ErrorKind::LegacyPositionUnavailable)
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    fn tx_position_in_block(
+        &self,
+        txid: &Txid,
+        block: &BlockId,
+        budget: &super::qualified_edges::ReadBudget,
+    ) -> Result<u16> {
+        use bitcoin::hashes::Hash;
+        let raw = self
+            .checked_proof_point(
+                budget,
+                &BlockRow::txids_key(full_hash(&block.hash[..])),
+                4 * 1024 * 1024,
+            )
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+        let position = super::qualified_edges::roster_position(&raw, full_hash(&txid[..]))
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+        let header = self
+            .header_by_hash(&block.hash)
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+        let merkle =
+            bitcoin::util::hash::bitcoin_merkle_root(raw[8..].chunks_exact(32).map(|hash| {
+                bitcoin::TxMerkleNode::from_slice(hash).expect("checked fixed32 hash")
+            }))
+            .ok_or(ErrorKind::LegacyPositionUnavailable)?;
+        if merkle != header.header().merkle_root {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        let confirmation = TxConfKey {
+            code: b'C',
+            txid: full_hash(&txid[..]),
+            blockhash: full_hash(&block.hash[..]),
+        };
+        let key = bincode_util::serialize_little(&confirmation)
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?;
+        if self
+            .checked_proof_point(budget, &key, 0)
+            .map_err(|_| Error::from(ErrorKind::LegacyPositionUnavailable))?
+            != Some(vec![])
+        {
+            bail!(ErrorKind::LegacyPositionUnavailable);
+        }
+        Ok(position)
     }
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
@@ -1691,7 +3490,7 @@ impl ChainQuery {
             .filter_map(|conf| {
                 headers.header_by_blockhash(&deserialize(&conf.key.blockhash).unwrap())
             })
-            .next()
+            .max_by_key(|header| header.height())
             .map(BlockId::from)
     }
 
@@ -1906,17 +3705,27 @@ fn index_blocks(
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     iconfig: &IndexerConfig,
     op: &Operation,
-) -> Vec<DBRow> {
+) -> Result<Vec<DBRow>> {
     block_entries
         .par_iter() // serialization is CPU-intensive
         .map(|b| {
+            if b.block.block_hash() != *b.entry.hash() {
+                return Err("block/header identity mismatch".into());
+            }
+            #[cfg(not(feature = "liquid"))]
+            if b.block.compute_merkle_root() != Some(b.block.header.merkle_root) {
+                return Err("block transaction merkle mismatch".into());
+            }
+            let block_hash = full_hash(&b.entry.hash()[..]);
             let mut rows = vec![];
             for (idx, tx) in b.block.txdata.iter().enumerate() {
                 let height = b.entry.height() as u32;
                 index_transaction(
                     tx,
                     height,
-                    idx as u16,
+                    u16::try_from(idx)
+                        .map_err(|_| Error::from("block transaction position overflow"))?,
+                    block_hash,
                     previous_txos_map,
                     &mut rows,
                     iconfig,
@@ -1924,10 +3733,10 @@ fn index_blocks(
                 );
             }
             rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
-            rows
+            Ok(rows)
         })
-        .flatten()
-        .collect()
+        .collect::<Result<Vec<Vec<DBRow>>>>()
+        .map(|batches| batches.into_iter().flatten().collect())
 }
 
 // TODO: return an iterator?
@@ -1935,6 +3744,7 @@ fn index_transaction(
     tx: &Transaction,
     confirmed_height: u32,
     tx_position: u16,
+    _block_hash: FullHash,
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
@@ -1996,6 +3806,22 @@ fn index_transaction(
             txi_index as u32,
         );
         rows.push(edge.into_row());
+        #[cfg(not(feature = "liquid"))]
+        rows.push(DBRow {
+            key: super::qualified_edges::EdgeKey {
+                script_hash: compute_script_hash(&prev_txo.script_pubkey),
+                funding_txid: full_hash(&txi.previous_output.txid[..]),
+                funding_vout: txi.previous_output.vout,
+                spending_height: confirmed_height,
+                spending_block_hash: _block_hash,
+                spending_position: tx_position,
+                spending_txid: txid,
+                spending_vin: txi_index as u32,
+            }
+            .encode()
+            .to_vec(),
+            value: vec![],
+        });
     }
 
     // Index issued assets & native asset pegins/pegouts/burns
@@ -2557,7 +4383,7 @@ fn from_utxo_cache(utxos_cache: CachedUtxoMap, chain: &ChainQuery) -> UtxoMap {
 mod tests {
     use super::{DBRow, TxHistoryRow};
     use crate::chain::Value;
-    use std::convert::TryInto;
+    use std::convert::{TryFrom, TryInto};
 
     #[test]
     fn tx_history_row_ser_deser_tests() {
@@ -2758,5 +4584,97 @@ mod cache_invalidation_layout_tests {
             #[cfg(feature = "liquid")]
             assert_eq!(keys[2], [b"z", &[7; 32][..]].concat());
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "liquid")))]
+mod supplemental_edge_writer_tests {
+    use super::*;
+    #[test]
+    fn actual_history_batch_contains_block_qualified_edges_and_keeps_ancestor_key_on_orphan_delete()
+    {
+        let point = OutPoint {
+            txid: deserialize(&[3u8; 32]).unwrap(),
+            vout: 0,
+        };
+        let previous = TxOut {
+            value: 5,
+            script_pubkey: Script::new(),
+        };
+        let tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![bitcoin::TxIn {
+                previous_output: point,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: 4,
+                script_pubkey: Script::new(),
+            }],
+        };
+        let config = IndexerConfig {
+            light_mode: false,
+            address_search: false,
+            index_unspendables: false,
+            network: Network::Regtest,
+        };
+        let prevouts = HashMap::from([(point, previous)]);
+        let mut ancestor = vec![];
+        let mut orphan = vec![];
+        index_transaction(
+            &tx,
+            10,
+            2,
+            [7; 32],
+            &prevouts,
+            &mut ancestor,
+            &config,
+            &Operation::AddBlocks,
+        );
+        index_transaction(
+            &tx,
+            20,
+            3,
+            [8; 32],
+            &prevouts,
+            &mut orphan,
+            &config,
+            &Operation::DeleteBlocks,
+        );
+        let edge = |rows: &[DBRow]| {
+            rows.iter()
+                .find_map(|row| super::super::qualified_edges::EdgeKey::decode(&row.key).ok())
+                .unwrap()
+        };
+        let ancestor_edge = edge(&ancestor);
+        let orphan_edge = edge(&orphan);
+        assert_eq!(ancestor_edge.funding_txid, full_hash(&point.txid[..]));
+        assert_eq!(ancestor_edge.spending_txid, full_hash(&tx.txid()[..]));
+        assert_eq!(ancestor_edge.spending_block_hash, [7; 32]);
+        assert_eq!(orphan_edge.spending_block_hash, [8; 32]);
+        assert_eq!(ancestor_edge.spending_position, 2);
+        assert_ne!(ancestor_edge.encode(), orphan_edge.encode());
+        assert!(ancestor.iter().any(|row| row.key.first() == Some(&b'H')));
+        assert_eq!(
+            ancestor
+                .iter()
+                .find(|row| row.key.first() == Some(&b'S'))
+                .unwrap()
+                .key,
+            orphan
+                .iter()
+                .find(|row| row.key.first() == Some(&b'S'))
+                .unwrap()
+                .key
+        );
+        let deleted: HashSet<_> = orphan
+            .into_iter()
+            .filter(|row| row.key.first() != Some(&b'S'))
+            .map(|row| row.key)
+            .collect();
+        assert!(deleted.contains(&orphan_edge.encode().to_vec()));
+        assert!(!deleted.contains(&ancestor_edge.encode().to_vec()));
+        assert!(!deleted.iter().any(|key| key.first() == Some(&b'S')));
     }
 }

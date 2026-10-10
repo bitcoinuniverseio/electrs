@@ -156,6 +156,9 @@ fn run_server(config: Arc<Config>) -> Result<()> {
             electrs::new_index::qualification::LoopAction::NoExtraWork => {}
         };
 
+        #[cfg(not(feature = "liquid"))]
+        indexer.continue_local_baseline(&daemon, &current_tip);
+
         // Update mempool
         if let Err(e) = Mempool::update(&mempool, &daemon) {
             // Log the error if the result is an Err

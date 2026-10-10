@@ -976,7 +976,7 @@ fn handle_request(
         (&Method::GET, Some(script_type @ &"address"), Some(script_str), None, None, None)
         | (&Method::GET, Some(script_type @ &"scripthash"), Some(script_str), None, None, None) => {
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
-            let stats = query.stats(&script_hash[..]);
+            let stats = query.stats(&script_hash[..])?;
             json_response(
                 json!({
                     *script_type: script_str,
@@ -1538,7 +1538,7 @@ fn handle_request(
                 vout: index.parse::<u32>()?,
             };
             let spend = query
-                .lookup_spend(&outpoint)
+                .lookup_spend(&outpoint)?
                 .map_or_else(SpendingValue::default, SpendingValue::from);
             let ttl = ttl_by_depth(
                 spend.status.as_ref().and_then(|status| status.block_height),
@@ -1552,7 +1552,7 @@ fn handle_request(
                 .lookup_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
             let spends: Vec<SpendingValue> = query
-                .lookup_tx_spends(tx)
+                .lookup_tx_spends(tx)?
                 .into_iter()
                 .map(|spend| spend.map_or_else(SpendingValue::default, SpendingValue::from))
                 .collect();
@@ -1686,17 +1686,25 @@ fn handle_request(
                     Txid::from_hex(txid_str)
                         .ok()
                         .and_then(|txid| query.lookup_txn(&txid))
-                        .map_or_else(Vec::new, |tx| {
-                            query
-                                .lookup_tx_spends(tx)
-                                .into_iter()
-                                .map(|spend| {
-                                    spend.map_or_else(SpendingValue::default, SpendingValue::from)
-                                })
-                                .collect()
-                        })
+                        .map_or_else(
+                            || Ok(Vec::new()),
+                            |tx| {
+                                Ok::<_, HttpError>(
+                                    query
+                                        .lookup_tx_spends(tx)?
+                                        .into_iter()
+                                        .map(|spend| {
+                                            spend.map_or_else(
+                                                SpendingValue::default,
+                                                SpendingValue::from,
+                                            )
+                                        })
+                                        .collect(),
+                                )
+                            },
+                        )
                 })
-                .collect();
+                .collect::<Result<Vec<_>, HttpError>>()?;
 
             json_response(spends, TTL_SHORT)
         }
@@ -1717,17 +1725,25 @@ fn handle_request(
                     Txid::from_hex(&txid_str)
                         .ok()
                         .and_then(|txid| query.lookup_txn(&txid))
-                        .map_or_else(Vec::new, |tx| {
-                            query
-                                .lookup_tx_spends(tx)
-                                .into_iter()
-                                .map(|spend| {
-                                    spend.map_or_else(SpendingValue::default, SpendingValue::from)
-                                })
-                                .collect()
-                        })
+                        .map_or_else(
+                            || Ok(Vec::new()),
+                            |tx| {
+                                Ok::<_, HttpError>(
+                                    query
+                                        .lookup_tx_spends(tx)?
+                                        .into_iter()
+                                        .map(|spend| {
+                                            spend.map_or_else(
+                                                SpendingValue::default,
+                                                SpendingValue::from,
+                                            )
+                                        })
+                                        .collect(),
+                                )
+                            },
+                        )
                 })
-                .collect();
+                .collect::<Result<Vec<_>, HttpError>>()?;
 
             json_response(spends, TTL_SHORT)
         }
@@ -1752,14 +1768,16 @@ fn handle_request(
                     if let (Some(hash), Some(index)) = (hash_part, index_part) {
                         if let (Ok(txid), Ok(vout)) = (Txid::from_hex(hash), index.parse::<u32>()) {
                             let outpoint = OutPoint { txid, vout };
-                            return query
-                                .lookup_spend(&outpoint)
-                                .map_or_else(SpendingValue::default, SpendingValue::from);
+                            return Ok::<_, HttpError>(
+                                query
+                                    .lookup_spend(&outpoint)?
+                                    .map_or_else(SpendingValue::default, SpendingValue::from),
+                            );
                         }
                     }
-                    SpendingValue::default()
+                    Ok(SpendingValue::default())
                 })
-                .collect();
+                .collect::<Result<Vec<_>, HttpError>>()?;
 
             json_response(spends, TTL_SHORT)
         }
@@ -2196,6 +2214,12 @@ impl From<bitcoin::util::address::Error> for HttpError {
 }
 impl From<errors::Error> for HttpError {
     fn from(e: errors::Error) -> Self {
+        if matches!(e.kind(), errors::ErrorKind::LegacyPositionUnavailable) {
+            return HttpError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "confirmed_position_unavailable".into(),
+            );
+        }
         warn!("errors::Error: {:?}", e);
         match e.description().to_string().as_ref() {
             "getblock RPC error: {\"code\":-5,\"message\":\"Block not found\"}" => {

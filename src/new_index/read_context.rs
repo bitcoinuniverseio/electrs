@@ -106,11 +106,92 @@ impl BootstrapObservation {
     }
 }
 
+/// Shared unchanged static profile preimage used by query and sole writer.
+/// Credentials/cookie are deliberately absent; callers publish only its hash.
+#[derive(Clone)]
+pub struct StaticReadProfile {
+    pub network: String,
+    pub magic: u32,
+    pub db_path: String,
+    pub rpc_address: String,
+    pub light_mode: bool,
+    pub index_unspendables: bool,
+    pub db_version: u32,
+    pub electrs_version: String,
+    pub electrum_discovery: bool,
+    pub work_limit: usize,
+    pub body_limit: usize,
+    pub history_proof_dir: Option<String>,
+}
+impl StaticReadProfile {
+    pub fn bytes(&self, bootstrap: &BootstrapObservation) -> Result<Vec<u8>, serde_json::Error> {
+        let bytes = serde_json::to_vec(&(
+            &self.network,
+            self.magic,
+            &self.db_path,
+            &self.rpc_address,
+            self.light_mode,
+            self.index_unspendables,
+            self.db_version,
+            &self.electrs_version,
+            self.electrum_discovery,
+            bootstrap.signet_challenge_sha256.as_ref(),
+            self.work_limit,
+            self.body_limit,
+        ))?;
+        if let Some(directory) = &self.history_proof_dir {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(fields) = value.as_array_mut() {
+                fields.push(serde_json::json!({"historyProofDirectory":directory}));
+            }
+            serde_json::to_vec(&value)
+        } else {
+            Ok(bytes)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn ready() -> Value {
         serde_json::json!({"chain":"signet","blocks":100,"headers":100,"bestblockhash":"1".repeat(64),"initialblockdownload":false,"signet_challenge":"51"})
+    }
+    #[test]
+    fn default_profile_preserves_old_tuple_and_explicit_local_evidence_binds_it() {
+        let bootstrap=BootstrapObservation::from_ready_response("signet",&serde_json::json!({"chain":"signet","blocks":10,"headers":10,"bestblockhash":"1".repeat(64),"initialblockdownload":false,"signet_challenge":"51"}),1).unwrap();
+        let mut profile = StaticReadProfile {
+            network: "signet".into(),
+            magic: 42,
+            db_path: "owned-db".into(),
+            rpc_address: "127.0.0.1:1".into(),
+            light_mode: false,
+            index_unspendables: false,
+            db_version: 2,
+            electrs_version: "test".into(),
+            electrum_discovery: false,
+            work_limit: 500,
+            body_limit: 131072,
+            history_proof_dir: None,
+        };
+        let old = serde_json::to_vec(&(
+            "signet",
+            42,
+            "owned-db",
+            "127.0.0.1:1",
+            false,
+            false,
+            2,
+            "test",
+            false,
+            bootstrap.signet_challenge_sha256.as_ref(),
+            500,
+            131072,
+        ))
+        .unwrap();
+        assert_eq!(profile.bytes(&bootstrap).unwrap(), old);
+        profile.history_proof_dir = Some("explicit-local-proof".into());
+        assert_ne!(profile.bytes(&bootstrap).unwrap(), old);
     }
     #[test]
     fn missing_invalid_and_oversized_challenge_never_qualify() {

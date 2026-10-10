@@ -37,6 +37,7 @@ pub struct Config {
     pub network_type: Network,
     pub magic: Option<u32>,
     pub db_path: PathBuf,
+    pub history_proof_dir: Option<PathBuf>,
     pub daemon_dir: PathBuf,
     pub blocks_dir: PathBuf,
     pub daemon_rpc_addr: SocketAddr,
@@ -175,6 +176,9 @@ impl Config {
                     .long("jsonrpc-import")
                     .help("Use JSONRPC instead of directly importing blk*.dat files. Useful for remote full node or low memory system"),
             )
+            .arg(Arg::with_name("history_proof_dir").long("history-proof-dir")
+                .help("Explicit existing local full txstore evidence directory, opened read-only; no RPC fallback or import")
+                .takes_value(true))
             .arg(
                 Arg::with_name("light_mode")
                     .long("lightmode")
@@ -511,6 +515,7 @@ impl Config {
             network_type,
             magic,
             db_path,
+            history_proof_dir: m.value_of("history_proof_dir").map(PathBuf::from),
             daemon_dir,
             blocks_dir,
             daemon_rpc_addr,
