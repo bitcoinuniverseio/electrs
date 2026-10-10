@@ -1,4 +1,4 @@
-name: Universe alternative isolation metadata only
+name: Universe controlled confinement proof
 
 on:
   workflow_dispatch:
@@ -15,6 +15,10 @@ on:
       - scripts/universe/sandbox-diagnostic.py
       - scripts/universe/sandbox-diagnostic.test.py
       - scripts/universe/alternative-isolation-metadata.py
+      - scripts/universe/confinement-proof.c
+      - scripts/universe/confinement-proof.py
+      - scripts/universe/confinement-build-child.py
+      - scripts/universe/confinement-proof.test.py
 
 permissions:
   contents: read
@@ -35,10 +39,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Read only existing alternative isolation metadata
+      - name: Qualify one resource-capped owned tiny confinement control
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 -B -I -S scripts/universe/alternative-isolation-metadata.py
+          /usr/bin/python3 -B -I -S scripts/universe/confinement-proof.py --run-proof
