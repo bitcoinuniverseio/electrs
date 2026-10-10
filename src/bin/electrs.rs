@@ -142,9 +142,18 @@ fn run_server(config: Arc<Config>) -> Result<()> {
 
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
-        if current_tip != tip {
-            indexer.update(&daemon)?;
-            tip = current_tip;
+        match electrs::new_index::qualification::loop_action(
+            current_tip != tip,
+            indexer.availability_validation_pending(),
+        ) {
+            electrs::new_index::qualification::LoopAction::IndexChangedTip => {
+                indexer.update(&daemon)?;
+                tip = current_tip;
+            }
+            electrs::new_index::qualification::LoopAction::RevalidateAvailability => {
+                indexer.revalidate_read_availability(&current_tip)
+            }
+            electrs::new_index::qualification::LoopAction::NoExtraWork => {}
         };
 
         // Update mempool

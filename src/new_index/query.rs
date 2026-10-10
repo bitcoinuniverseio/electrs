@@ -1,6 +1,8 @@
 use rayon::prelude::*;
 
 use std::collections::{BTreeSet, HashMap};
+#[cfg(not(feature = "liquid"))]
+use std::convert::TryFrom;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
@@ -31,8 +33,94 @@ pub struct Query {
     config: Arc<Config>,
     cached_estimates: RwLock<(HashMap<u16, f64>, Option<Instant>)>,
     cached_relayfee: RwLock<Option<f64>>,
+    #[cfg(not(feature = "liquid"))]
+    page_readers: super::page_http::ReaderBudget,
+    #[cfg(not(feature = "liquid"))]
+    page_codec: Option<super::page_http::CursorCodec>,
     #[cfg(feature = "liquid")]
     asset_db: Option<Arc<RwLock<AssetRegistry>>>,
+}
+
+#[cfg(not(feature = "liquid"))]
+struct PagedQuerySnapshot<'a> {
+    query: &'a Query,
+    chain: super::schema::PagedChainSnapshot<'a>,
+    scope: super::paged_outputs::ReadScope,
+    script_hash: super::schema::FullHash,
+}
+#[cfg(not(feature = "liquid"))]
+impl super::paged_outputs::PageSource for PagedQuerySnapshot<'_> {
+    fn valid(
+        &self,
+        scope: &super::paged_outputs::ReadScope,
+    ) -> Result<(), super::paged_outputs::PageError> {
+        use super::paged_outputs::PageError;
+        if scope != &self.scope {
+            return Err(PageError::Contract);
+        }
+        self.chain.valid()?;
+        let mempool = self
+            .query
+            .mempool
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        if mempool.paged_read_epoch() != Some((scope.chain_generation, scope.mempool_generation)) {
+            return Err(PageError::Changed);
+        }
+        Ok(())
+    }
+    fn history(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::HistoryRecord>, super::paged_outputs::PageError> {
+        self.chain.history(after)
+    }
+    fn confirmation(
+        &self,
+        txid: &Txid,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::ConfirmationRecord>, super::paged_outputs::PageError>
+    {
+        self.chain.confirmation(txid, after)
+    }
+    fn spend(
+        &self,
+        point: &OutPoint,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::SpendRecord>, super::paged_outputs::PageError> {
+        self.chain.spend(point, after)
+    }
+    fn mempool_spent(&self, point: &OutPoint) -> Result<bool, super::paged_outputs::PageError> {
+        use super::paged_outputs::PageError;
+        let mempool = self
+            .query
+            .mempool
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        if mempool.paged_read_epoch()
+            != Some((self.scope.chain_generation, self.scope.mempool_generation))
+        {
+            return Err(PageError::Changed);
+        }
+        Ok(mempool.paged_has_spend(point))
+    }
+    fn mempool(
+        &self,
+        offset: usize,
+    ) -> Result<Option<super::paged_outputs::MempoolRecord>, super::paged_outputs::PageError> {
+        use super::paged_outputs::PageError;
+        let mempool = self
+            .query
+            .mempool
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        if mempool.paged_read_epoch()
+            != Some((self.scope.chain_generation, self.scope.mempool_generation))
+        {
+            return Err(PageError::Changed);
+        }
+        mempool.paged_history_record(&self.script_hash, offset)
+    }
 }
 
 impl Query {
@@ -50,6 +138,9 @@ impl Query {
             config,
             cached_estimates: RwLock::new((HashMap::new(), None)),
             cached_relayfee: RwLock::new(None),
+            page_readers: super::page_http::ReaderBudget::new(),
+            page_codec: option_env!("ELECTRS_SOURCE_REVISION")
+                .and_then(|_| super::page_http::CursorCodec::new_os()),
         }
     }
 
@@ -102,6 +193,160 @@ impl Query {
         maxburnamount: Option<f64>,
     ) -> Result<SubmitPackageResult> {
         self.daemon.submit_package(txhex, maxfeerate, maxburnamount)
+    }
+
+    /// New opt-in bounded lane; independent of legacy utxo/vector/cache calls.
+    #[cfg(not(feature = "liquid"))]
+    pub(crate) fn paged_outputs(
+        &self,
+        script_hash: super::schema::FullHash,
+        cursor: Option<&super::paged_outputs::PageCursor>,
+        expected: &super::page_http::ExpectedScope,
+        deadline: Instant,
+    ) -> Result<
+        (
+            super::paged_outputs::OutputPage,
+            super::paged_outputs::PageCursor,
+        ),
+        super::paged_outputs::PageError,
+    > {
+        use super::paged_outputs::{PageCursor, PageError, PageSource, ReadScope};
+        use sha2::{Digest, Sha256};
+        // Full immutable build stamp is required only by this new lane.
+        let revision = option_env!("ELECTRS_SOURCE_REVISION").ok_or(PageError::Unavailable)?;
+        let (chain_generation, tip, genesis) = self.chain.paged_read_context()?;
+        let mempool_generation = {
+            let mempool = self
+                .mempool
+                .try_read()
+                .map_err(|_| PageError::Unavailable)?;
+            let (chain, mempool) = mempool.paged_read_epoch().ok_or(PageError::Unavailable)?;
+            if chain != chain_generation {
+                return Err(PageError::Changed);
+            }
+            mempool
+        };
+        let network = match self.network() {
+            Network::Bitcoin => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Testnet4 => "testnet4",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        };
+        let bootstrap = self
+            .daemon
+            .paged_bootstrap_observation()
+            .filter(|value| value.validate(network))
+            .ok_or(PageError::Unavailable)?
+            .clone();
+        // Binding hashes static read-affecting configuration, excluding cookie
+        // and credentials. It is a profile binding, not a source observation.
+        let profile = serde_json::to_vec(&(
+            network,
+            self.config.magic,
+            self.config.db_path.to_string_lossy(),
+            self.config.daemon_rpc_addr.to_string(),
+            self.config.light_mode,
+            self.config.index_unspendables,
+            super::db::DB_VERSION,
+            crate::config::ELECTRS_VERSION,
+            cfg!(feature = "electrum-discovery"),
+            bootstrap.signet_challenge_sha256.as_ref(),
+            super::paged_outputs::WORK_LIMIT,
+            super::paged_outputs::BODY_LIMIT,
+        ))
+        .map_err(|_| PageError::Contract)?;
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
+        let scope = ReadScope {
+            source_authority: "mempool-electrs".into(),
+            chain: "bitcoin".into(),
+            network: network.into(),
+            bootstrap,
+            genesis_hash: genesis.to_string(),
+            artifact_revision: revision.into(),
+            profile_sha256: hex(&Sha256::digest(&profile)),
+            script_hash: hex(&script_hash),
+            chain_generation,
+            mempool_generation,
+            height: u32::try_from(tip.height).map_err(|_| PageError::Contract)?,
+            block_hash: tip.hash.to_string(),
+        };
+        scope.validate()?;
+        if !expected.matches(&scope) {
+            return Err(PageError::Changed);
+        }
+        let initial = PageCursor::initial(scope.clone());
+        let state = cursor.unwrap_or(&initial);
+        if state.scope != scope {
+            return Err(PageError::Changed);
+        }
+        state.validate()?;
+        let source = PagedQuerySnapshot {
+            query: self,
+            chain: self.chain.paged_snapshot(script_hash, chain_generation)?,
+            scope,
+            script_hash,
+        };
+        source.valid(&state.scope)?;
+        super::paged_outputs::read_page_until(&source, state, deadline)
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn paged_wire_response(
+        &self,
+        script_hash: super::schema::FullHash,
+        request: &super::page_http::PageRequest,
+    ) -> Result<Vec<u8>, super::paged_outputs::PageError> {
+        use super::paged_outputs::{PageError, BODY_LIMIT};
+        // Synchronous owner keeps lease through all actual IO, serialization and
+        // final fences. Client disconnect/deadline cannot release it early.
+        let _lease = self.page_readers.acquire()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let codec = self.page_codec.as_ref().ok_or(PageError::Unavailable)?;
+        let cursor = request
+            .cursor
+            .as_ref()
+            .map(|value| codec.decode(value))
+            .transpose()?;
+        let (page, next) =
+            self.paged_outputs(script_hash, cursor.as_ref(), &request.expected, deadline)?;
+        let token = if next.complete {
+            None
+        } else {
+            Some(codec.encode(&next)?)
+        };
+        let bytes=serde_json::to_vec(&serde_json::json!({"page":page,"cursor":token,
+            "created_unix_seconds":next.created_unix_seconds,"expires_unix_seconds":next.expires_unix_seconds}))
+            .map_err(|_|PageError::Contract)?;
+        if bytes.len() > BODY_LIMIT {
+            return Err(PageError::Capacity);
+        }
+        let (epoch, tip, genesis) = self.chain.paged_read_context()?;
+        if epoch != next.scope.chain_generation
+            || tip.height as u64 != next.scope.height as u64
+            || tip.hash.to_string() != next.scope.block_hash
+            || genesis.to_string() != next.scope.genesis_hash
+        {
+            return Err(PageError::Changed);
+        }
+        let mempool = self
+            .mempool
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        if mempool.paged_read_epoch()
+            != Some((next.scope.chain_generation, next.scope.mempool_generation))
+        {
+            return Err(PageError::Changed);
+        }
+        if Instant::now() >= deadline {
+            return Err(PageError::Deadline);
+        }
+        Ok(bytes)
     }
 
     pub fn utxo(&self, scripthash: &[u8]) -> Result<Vec<Utxo>> {

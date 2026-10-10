@@ -1,3 +1,5 @@
+use super::read_generation::ReadGeneration;
+use super::writer_update::{finish_qualified_plan, Phase, UpdatePlan, UpdateWriter};
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::util::merkleblock::MerkleBlock;
@@ -42,6 +44,7 @@ use super::{db::ReverseScanGroupIterator, fetch::bitcoind_sequential_fetcher};
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
 pub struct Store {
+    read_generation: ReadGeneration,
     // TODO: should be column families
     txstore_db: DB,
     history_db: DB,
@@ -53,6 +56,12 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, config: &Config) -> Self {
+        // Fresh absent stores can derive an initial complete write generation.
+        // Preexisting stores require a separate proven baseline; current native
+        // producer behavior remains intact while the new lane stays unavailable.
+        let fresh_read_baseline = !["txstore", "history", "cache"]
+            .iter()
+            .any(|name| path.join(name).exists());
         let txstore_db = DB::open(&path.join("txstore"), config);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
@@ -77,6 +86,11 @@ impl Store {
         };
 
         Store {
+            read_generation: if fresh_read_baseline {
+                ReadGeneration::new()
+            } else {
+                ReadGeneration::new_existing_unqualified()
+            },
             txstore_db,
             history_db,
             cache_db,
@@ -171,6 +185,8 @@ impl ScriptStats {
 }
 
 pub struct Indexer {
+    pending_read_update: Option<UpdatePlan<HeaderEntry, BlockHash>>,
+    availability_validation_tip: Option<BlockHash>,
     store: Arc<Store>,
     flush: DBFlush,
     from: FetchFrom,
@@ -229,6 +245,8 @@ impl std::fmt::Display for Operation {
 impl Indexer {
     pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
         Indexer {
+            pending_read_update: None,
+            availability_validation_tip: None,
             store,
             flush: DBFlush::Disable,
             from,
@@ -284,7 +302,7 @@ impl Indexer {
         Ok(result)
     }
 
-    fn reorg(&self, reorged: Vec<HeaderEntry>, daemon: &Daemon) -> Result<()> {
+    fn reorg(&self, reorged: &[HeaderEntry], daemon: &Daemon) -> Result<()> {
         if reorged.len() > 10 {
             warn!(
                 "reorg of over 10 blocks ({}) detected! Wonky stuff might happen!",
@@ -295,10 +313,10 @@ impl Indexer {
         // if we reorg the whole mainnet chain it should come out to about 145 GB of memory.
         let (tx, rx) = crossbeam_channel::unbounded();
         // Delete history_db
-        bitcoind_sequential_fetcher(daemon, reorged.clone())?
+        bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
             .map(|blocks| self.index(&blocks, Operation::DeleteBlocksWithHistory(tx.clone())));
         // Delete txstore
-        bitcoind_sequential_fetcher(daemon, reorged)?
+        bitcoind_sequential_fetcher(daemon, reorged.to_vec())?
             .map(|blocks| self.add(&blocks, Operation::DeleteBlocks));
         // All senders must be dropped for receiver iterator to finish
         drop(tx);
@@ -321,76 +339,174 @@ impl Indexer {
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
-        let new_headers = self.get_new_headers(&daemon, &tip)?;
-
-        // Must rollback blocks before rolling forward
-        let headers_len = {
-            let mut headers = self.store.indexed_headers.write().unwrap();
-            let (reorged, rollback_tip) = headers.apply(new_headers.clone());
-            assert_eq!(tip, *headers.tip());
-            let headers_len = headers.len();
-            drop(headers);
-
-            if !reorged.is_empty() {
-                // We should rollback the tip blockhash first in case something crashes during rollback
-                // or before the next block appears and sets the new tip.
-                match rollback_tip {
-                    Some(rb_tip) => {
-                        debug!("updating reorged tip to {:?}", rb_tip);
-                        self.store.txstore_db.put_sync(b"t", &serialize(&rb_tip));
-                    }
-                    None => {
-                        // This should only happen on regtest or some weird networks.
-                        error!("Rollback to genesis block detected!!! (rollback to height 0)");
-                        // There is no tip anymore.
-                        self.store.txstore_db.delete(vec![b"t".into()]);
-                    }
-                }
-
-                self.reorg(reorged, &daemon)?;
-            }
-
-            headers_len
+        // A failed retained plan is repaired before deriving work from headers
+        // that may already have advanced. Never substitute empty new_headers.
+        let publication_store = Arc::clone(&self.store);
+        let has_pending = self.pending_read_update.is_some();
+        // A missing retained plan after panic is NOT recoverable by an empty or
+        // newly derived plan. Verified startup reconciliation is still required.
+        let can_repair = has_pending || !publication_store.read_generation.requires_repair();
+        let new_headers = if has_pending {
+            None
+        } else {
+            Some(self.get_new_headers(&daemon, &tip)?)
         };
-
-        let to_add = self.headers_to_add(&new_headers);
-        debug!(
-            "adding transactions from {} blocks using {:?}",
-            to_add.len(),
-            self.from
-        );
-        start_fetcher(self.from, &daemon, to_add)?
-            .map(|blocks| self.add(&blocks, Operation::AddBlocks));
-        self.start_auto_compactions(&self.store.txstore_db);
-
-        let to_index = self.headers_to_index(&new_headers);
-        debug!(
-            "indexing history from {} blocks using {:?}",
-            to_index.len(),
-            self.from
-        );
-        start_fetcher(self.from, &daemon, to_index)?
-            .map(|blocks| self.index(&blocks, Operation::AddBlocks));
-        self.start_auto_compactions(&self.store.history_db);
-
-        if let DBFlush::Disable = self.flush {
-            debug!("flushing to disk");
-            self.store.txstore_db.flush();
-            self.store.history_db.flush();
-            self.flush = DBFlush::Enable;
+        let noop_candidate = !has_pending
+            && new_headers.as_ref().unwrap().is_empty()
+            && self.store.read_generation.completed().is_some();
+        match super::qualification::validated_noop(
+            noop_candidate,
+            || self.store.txstore_db.qualified_get(b"t", 32),
+            &serialize(&tip),
+        ) {
+            super::qualification::NoopDecision::Qualified => return Ok(tip),
+            super::qualification::NoopDecision::AvailabilityFault => {
+                // Only this pre-mutation storage failure retains closed data.
+                let header_matches = self
+                    .store
+                    .indexed_headers
+                    .try_read()
+                    .map(|h| *h.tip() == tip)
+                    .unwrap_or(false);
+                if header_matches {
+                    publication_store.read_generation.invalidate_availability();
+                    self.availability_validation_tip = Some(tip);
+                } else {
+                    publication_store.read_generation.invalidate_material();
+                    self.availability_validation_tip = None;
+                }
+                warn!("paged noop storage availability withheld; legacy producer continues");
+                return Ok(tip);
+            }
+            super::qualification::NoopDecision::MaterialFault => {
+                // No extra producer work or data writes to bless a failed point
+                // proof. Invalidate old readers and keep the new lane unavailable.
+                publication_store.read_generation.invalidate_material();
+                self.availability_validation_tip = None;
+                warn!("paged noop point proof withheld; legacy producer continues");
+                return Ok(tip);
+            }
+            super::qualification::NoopDecision::NotCandidate => {}
         }
-
-        // update the synced tip *after* the new data is flushed to disk
-        debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
-
+        self.availability_validation_tip = None;
+        let read_mutation = publication_store.read_generation.begin();
+        let mut completion = None;
+        if has_pending {
+            completion = self.finish_pending_read_update(&daemon)?;
+        }
+        let new_headers = match new_headers {
+            Some(headers) => headers,
+            None => self.get_new_headers(&daemon, &tip)?,
+        };
+        let prior_plan_qualified = !has_pending || completion.is_some();
+        // If the source advanced during recovery, finish the old plan then
+        // reconcile this target under the SAME odd lease before publishing.
+        if !has_pending || !new_headers.is_empty() {
+            let (reorged, rollback_tip) = {
+                let mut headers = self.store.indexed_headers.write().unwrap();
+                let result = headers.apply(new_headers.clone());
+                assert_eq!(tip, *headers.tip());
+                result
+            };
+            self.pending_read_update = Some(UpdatePlan {
+                target: tip,
+                headers: new_headers,
+                reorged,
+                rollback_tip,
+                phase: Phase::Rollback,
+            });
+            completion = self.finish_pending_read_update(&daemon)?;
+        }
+        // The proof comes only from completed rollback/reorg/add/index/flush/
+        // persisted-tip verification. A fresh lease is never recovery evidence.
+        if let Some(proof) = completion {
+            let publication = if can_repair && prior_plan_qualified {
+                read_mutation.commit_repaired(proof)
+            } else {
+                read_mutation.commit()
+            };
+            if publication.is_err() {
+                warn!("paged read publication remains unavailable after writer update");
+            }
+        }
         if let FetchFrom::BlkFiles = self.from {
             self.from = FetchFrom::Bitcoind;
         }
-
-        self.tip_metric.set(headers_len as i64 - 1);
-
+        if let Ok(headers) = self.store.indexed_headers.try_read() {
+            self.tip_metric.set(headers.len() as i64 - 1);
+        }
         Ok(tip)
+    }
+
+    pub fn availability_validation_pending(&self) -> bool {
+        self.availability_validation_tip.is_some()
+            && self.pending_read_update.is_none()
+            && self.store.read_generation.availability_fence().is_some()
+    }
+    /// Called only at the existing loop boundary, using its already observed
+    /// unchanged Core tip. No RPC, header apply, marker/DB write or fresh time.
+    pub fn revalidate_read_availability(&mut self, current_tip: &BlockHash) {
+        let fence = match self.store.read_generation.availability_fence() {
+            Some(f) => f,
+            None => return,
+        };
+        let anchor = match self.availability_validation_tip {
+            Some(tip) => tip,
+            None => {
+                self.store.read_generation.invalidate_material();
+                return;
+            }
+        };
+        let headers_match = self
+            .store
+            .indexed_headers
+            .try_read()
+            .map(|headers| *headers.tip() == anchor)
+            .unwrap_or(false);
+        if self.pending_read_update.is_some() || *current_tip != anchor || !headers_match {
+            self.store.read_generation.invalidate_material();
+            self.availability_validation_tip = None;
+            return;
+        }
+        let result = super::qualification::revalidate_availability(
+            &self.store.read_generation,
+            Some(fence),
+            true,
+            || self.store.txstore_db.qualified_get(b"t", 32),
+            &serialize(&anchor),
+        );
+        match result {
+            super::qualification::AvailabilityValidation::Restored(_)
+            | super::qualification::AvailabilityValidation::MaterialBlocked => {
+                self.availability_validation_tip = None
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_pending_read_update(
+        &mut self,
+        daemon: &Daemon,
+    ) -> Result<Option<super::writer_update::CompletedPlan>> {
+        let mut plan = self
+            .pending_read_update
+            .take()
+            .expect("retained update plan required");
+        let mut writer = IndexerReadWriter {
+            indexer: self,
+            daemon,
+            qualified: true,
+        };
+        let result = finish_qualified_plan(&mut writer, &mut plan);
+        // Ordinary error retains exact work and phase. A panic drops the plan:
+        // the generation latch then deliberately refuses future qualification.
+        if result.is_err() {
+            self.pending_read_update = Some(plan);
+        }
+        // Only legacy producer errors propagate to the existing fatal main
+        // error policy. Qualification-only failures discard the read proof,
+        // causing the lease to remain failed without killing valid indexing.
+        result
     }
 
     fn add(&self, blocks: &[BlockEntry], op: Operation) {
@@ -469,6 +585,235 @@ impl Indexer {
                 .history_db
                 .delete(rows.into_iter().map(|r| r.key).collect());
         }
+        // Keep the existing marker filter consistent with the completed DB
+        // batch, including a removed fork that later becomes current again.
+        let mut indexed = self.store.indexed_blockhashes.write().unwrap();
+        if let Operation::AddBlocks = op {
+            indexed.extend(blocks.iter().map(|b| *b.entry.hash()));
+        } else {
+            for block in blocks {
+                indexed.remove(block.entry.hash());
+            }
+        }
+    }
+}
+
+// Adapter uses the existing writer, fetchers, markers and flush policy. There is
+// no second DB writer, background task, new RPC pool or reader-induced lock.
+struct IndexerReadWriter<'a> {
+    indexer: &'a mut Indexer,
+    daemon: &'a Daemon,
+    qualified: bool,
+}
+impl UpdateWriter<HeaderEntry, BlockHash> for IndexerReadWriter<'_> {
+    type Error = Error;
+    fn rollback(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        if !plan.reorged.is_empty() {
+            match plan.rollback_tip {
+                Some(tip) => self
+                    .indexer
+                    .store
+                    .txstore_db
+                    .put_sync(b"t", &serialize(&tip)),
+                None => self.indexer.store.txstore_db.delete(vec![b"t".into()]),
+            }
+        }
+        Ok(())
+    }
+    fn reorg(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        if !plan.reorged.is_empty() {
+            self.indexer.reorg(&plan.reorged, self.daemon)?;
+        }
+        Ok(())
+    }
+    fn add(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        let headers = self.indexer.headers_to_add(&plan.headers);
+        start_fetcher(self.indexer.from, self.daemon, headers)?
+            .map(|blocks| self.indexer.add(&blocks, Operation::AddBlocks));
+        self.indexer
+            .start_auto_compactions(&self.indexer.store.txstore_db);
+        Ok(())
+    }
+    fn index(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        let headers = self.indexer.headers_to_index(&plan.headers);
+        start_fetcher(self.indexer.from, self.daemon, headers)?
+            .map(|blocks| self.indexer.index(&blocks, Operation::AddBlocks));
+        self.indexer
+            .start_auto_compactions(&self.indexer.store.history_db);
+        Ok(())
+    }
+    fn flush(&mut self, _: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        if let DBFlush::Disable = self.indexer.flush {
+            self.indexer.store.txstore_db.flush();
+            self.indexer.store.history_db.flush();
+            self.indexer.flush = DBFlush::Enable;
+        }
+        Ok(())
+    }
+    fn persist_tip(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        self.indexer
+            .store
+            .txstore_db
+            .put_sync(b"t", &serialize(&plan.target));
+        Ok(())
+    }
+    fn read_qualified(&self) -> bool {
+        self.qualified
+    }
+
+    fn verify(&mut self, plan: &UpdatePlan<HeaderEntry, BlockHash>) -> Result<()> {
+        let store = &self.indexer.store;
+        let header_matches = store
+            .indexed_headers
+            .try_read()
+            .map(|headers| *headers.tip() == plan.target)
+            .unwrap_or(false);
+        if !header_matches
+            || !super::qualification::point_matches(
+                store.txstore_db.qualified_get(b"t", 32),
+                &serialize(&plan.target),
+            )
+        {
+            self.qualified = false;
+            warn!("paged writer target fence failed; legacy producer continues");
+            return Ok(());
+        }
+        // Point reads of only the retained work, not a global database scan.
+        for header in &plan.headers {
+            let key = BlockRow::new_done(full_hash(&header.hash()[..]))
+                .into_row()
+                .key;
+            if !super::qualification::point_present(store.txstore_db.qualified_get(&key, 0))
+                || !super::qualification::point_present(store.history_db.qualified_get(&key, 0))
+            {
+                self.qualified = false;
+                warn!("paged writer required phase marker missing; legacy producer continues");
+                return Ok(());
+            }
+        }
+        if !plan.reorged.is_empty() {
+            // INTERIM fail closed: delete logs/discards individual DB errors;
+            // marker absence is not original-key deletion completeness. Exact
+            // immutable deletion replay proof remains a source-only prerequisite.
+            self.qualified = false;
+            warn!("paged reorg cleanup proof unavailable; legacy producer continues");
+            return Ok(());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "liquid"))]
+pub struct PagedChainSnapshot<'a> {
+    chain: &'a ChainQuery,
+    history: super::db::BoundedSnapshot<'a>,
+    txstore: super::db::BoundedSnapshot<'a>,
+    epoch: u64,
+    script_hash: FullHash,
+}
+#[cfg(not(feature = "liquid"))]
+impl PagedChainSnapshot<'_> {
+    pub fn valid(&self) -> Result<(), super::paged_outputs::PageError> {
+        if self.chain.matches_read_generation(self.epoch) {
+            Ok(())
+        } else {
+            Err(super::paged_outputs::PageError::Changed)
+        }
+    }
+    pub fn history(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::HistoryRecord>, super::paged_outputs::PageError> {
+        use super::paged_outputs::{Funding, HistoryRecord, PageError};
+        self.valid()?;
+        let prefix = TxHistoryRow::filter(b'H', &self.script_hash);
+        let row = match self.history.next_record(&prefix, after)? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let decoded: TxHistoryKey =
+            bincode_util::deserialize_big(&row.key).map_err(|_| PageError::Contract)?;
+        if decoded.code != b'H'
+            || decoded.hash != self.script_hash
+            || bincode_util::serialize_big(&decoded).map_err(|_| PageError::Contract)? != row.key
+        {
+            return Err(PageError::Contract);
+        }
+        let funding = match decoded.txinfo {
+            TxHistoryInfo::Funding(value) => Some(Funding {
+                txid: deserialize(&value.txid).map_err(|_| PageError::Contract)?,
+                vout: value.vout,
+                value: value.value,
+                height: decoded.confirmed_height,
+            }),
+            TxHistoryInfo::Spending(_) => None,
+        };
+        Ok(Some(HistoryRecord {
+            key: row.key,
+            funding,
+        }))
+    }
+    pub fn confirmation(
+        &self,
+        txid: &Txid,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::ConfirmationRecord>, super::paged_outputs::PageError>
+    {
+        use super::paged_outputs::{ConfirmationRecord, PageError};
+        self.valid()?;
+        let row = match self
+            .txstore
+            .next_record(&TxConfRow::filter(&txid[..]), after)?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let decoded: TxConfKey =
+            bincode_util::deserialize_little(&row.key).map_err(|_| PageError::Contract)?;
+        if decoded.code != b'C'
+            || decoded.txid != full_hash(&txid[..])
+            || bincode_util::serialize_little(&decoded).map_err(|_| PageError::Contract)? != row.key
+        {
+            return Err(PageError::Contract);
+        }
+        let hash: BlockHash = deserialize(&decoded.blockhash).map_err(|_| PageError::Contract)?;
+        // Short, nonblocking header lock for ONE confirmation row.
+        let headers = self
+            .chain
+            .store
+            .indexed_headers
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        let canonical = headers.header_by_blockhash(&hash).map(BlockId::from);
+        Ok(Some(ConfirmationRecord {
+            key: row.key,
+            canonical,
+        }))
+    }
+    pub fn spend(
+        &self,
+        point: &OutPoint,
+        after: Option<&[u8]>,
+    ) -> Result<Option<super::paged_outputs::SpendRecord>, super::paged_outputs::PageError> {
+        use super::paged_outputs::{PageError, SpendRecord};
+        self.valid()?;
+        let row = match self.history.next_record(&TxEdgeRow::filter(point), after)? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let decoded: TxEdgeKey =
+            bincode_util::deserialize_little(&row.key).map_err(|_| PageError::Contract)?;
+        if decoded.code != b'S'
+            || decoded.funding_txid != full_hash(&point.txid[..])
+            || decoded.funding_vout != point.vout
+            || bincode_util::serialize_little(&decoded).map_err(|_| PageError::Contract)? != row.key
+        {
+            return Err(PageError::Contract);
+        }
+        Ok(Some(SpendRecord {
+            key: row.key,
+            txid: deserialize(&decoded.spending_txid).map_err(|_| PageError::Contract)?,
+        }))
     }
 }
 
@@ -484,6 +829,53 @@ impl ChainQuery {
                 &["name"],
             ),
         }
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn paged_read_context(
+        &self,
+    ) -> Result<(u64, BlockId, BlockHash), super::paged_outputs::PageError> {
+        use super::paged_outputs::PageError;
+        let epoch = self
+            .completed_read_generation()
+            .ok_or(PageError::Unavailable)?;
+        let headers = self
+            .store
+            .indexed_headers
+            .try_read()
+            .map_err(|_| PageError::Unavailable)?;
+        let tip = headers
+            .header_by_blockhash(headers.tip())
+            .map(BlockId::from)
+            .ok_or(PageError::Unavailable)?;
+        let genesis = *headers
+            .header_by_height(0)
+            .ok_or(PageError::Unavailable)?
+            .hash();
+        if !self.matches_read_generation(epoch) {
+            return Err(PageError::Changed);
+        }
+        Ok((epoch, tip, genesis))
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn paged_snapshot(
+        &self,
+        script_hash: FullHash,
+        epoch: u64,
+    ) -> Result<PagedChainSnapshot<'_>, super::paged_outputs::PageError> {
+        if !self.matches_read_generation(epoch) {
+            return Err(super::paged_outputs::PageError::Unavailable);
+        }
+        let snapshot = PagedChainSnapshot {
+            chain: self,
+            history: self.store.history_db.bounded_snapshot(),
+            txstore: self.store.txstore_db.bounded_snapshot(),
+            epoch,
+            script_hash,
+        };
+        snapshot.valid()?;
+        Ok(snapshot)
     }
 
     pub fn network(&self) -> Network {
@@ -607,6 +999,13 @@ impl ChainQuery {
             mtp: self.get_mtp(header_entry.height()),
             header_entry,
         })
+    }
+
+    pub fn completed_read_generation(&self) -> Option<u64> {
+        self.store.read_generation.completed()
+    }
+    pub fn matches_read_generation(&self, generation: u64) -> bool {
+        self.store.read_generation.matches(generation)
     }
 
     pub fn history_iter_scan(

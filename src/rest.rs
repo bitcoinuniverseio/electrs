@@ -618,12 +618,52 @@ async fn run_server(
                 async move {
                     let method = req.method().clone();
                     let uri = req.uri().clone();
-                    let body = hyper::body::to_bytes(req.into_body()).await?;
-
-                    let mut resp = tokio::task::block_in_place(|| {
-                        handle_request(method, uri, body, &query, &config)
-                    })
-                    .unwrap_or_else(|err| {
+                    #[cfg(not(feature = "liquid"))]
+                    let paged = uri.path().starts_with("/v1/address/");
+                    #[cfg(feature = "liquid")]
+                    let paged = false;
+                    #[cfg(not(feature = "liquid"))]
+                    let mut close_rejected_body = false;
+                    let result = if paged {
+                        #[cfg(not(feature = "liquid"))]
+                        {
+                            use hyper::body::HttpBody;
+                            let mut lengths =
+                                req.headers().get_all(hyper::header::CONTENT_LENGTH).iter();
+                            let first = lengths.next();
+                            let body_allowed = lengths.next().is_none()
+                                && first.map_or(true, |v| v.as_bytes() == b"0")
+                                && !req.headers().contains_key(hyper::header::TRANSFER_ENCODING)
+                                && req.body().is_end_stream();
+                            close_rejected_body =
+                                !body_allowed && req.version() != hyper::Version::HTTP_2;
+                            // Drop the new lane's body receiver without ever
+                            // awaiting or draining it. HTTP/1 rejects close the
+                            // connection; HTTP/2 receiver drop is stream-local.
+                            // Actual Hyper integration still requires Linux tests.
+                            drop(req);
+                            if !body_allowed {
+                                Err(HttpError(
+                                    StatusCode::BAD_REQUEST,
+                                    "paged output request body is not allowed".into(),
+                                ))
+                            } else {
+                                tokio::task::block_in_place(|| {
+                                    handle_paged_outputs(&method, &uri, &query, &config)
+                                })
+                            }
+                        }
+                        #[cfg(feature = "liquid")]
+                        {
+                            unreachable!()
+                        }
+                    } else {
+                        let body = hyper::body::to_bytes(req.into_body()).await?;
+                        tokio::task::block_in_place(|| {
+                            handle_request(method, uri, body, &query, &config)
+                        })
+                    };
+                    let mut resp = result.unwrap_or_else(|err| {
                         warn!("{:?}", err);
                         Response::builder()
                             .status(err.0)
@@ -631,6 +671,11 @@ async fn run_server(
                             .body(Body::from(err.1))
                             .unwrap()
                     });
+                    #[cfg(not(feature = "liquid"))]
+                    if close_rejected_body {
+                        resp.headers_mut()
+                            .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
+                    }
                     resp.headers_mut()
                         .insert("X-Powered-By", HeaderValue::from_static(&VERSION_STRING));
                     if let Some(ref origins) = config.cors {
@@ -713,6 +758,58 @@ impl Handle {
         self.tx.send(()).expect("failed to send shutdown signal");
         self.thread.join().expect("REST server failed");
     }
+}
+
+#[cfg(not(feature = "liquid"))]
+fn handle_paged_outputs(
+    method: &Method,
+    uri: &hyper::Uri,
+    query: &Query,
+    config: &Config,
+) -> Result<Response<Body>, HttpError> {
+    use crate::new_index::{
+        page_http::{page_address, parse_request},
+        paged_outputs::PageError,
+    };
+    // Never log URI/query: active cursors must not enter native/public logs.
+    if method != Method::GET || uri.scheme().is_some() || uri.authority().is_some() {
+        return Err(HttpError(
+            StatusCode::BAD_REQUEST,
+            "paged output origin-form GET required".into(),
+        ));
+    }
+    let map_error = |error: PageError| {
+        let status = match error {
+            PageError::Changed => StatusCode::CONFLICT,
+            PageError::Expired => StatusCode::GONE,
+            PageError::Contract => StatusCode::BAD_REQUEST,
+            PageError::Capacity => StatusCode::TOO_MANY_REQUESTS,
+            PageError::Deadline => StatusCode::GATEWAY_TIMEOUT,
+            PageError::Unavailable | PageError::Storage => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        HttpError(status, format!("paged output {:?}", error))
+    };
+    let address = page_address(
+        uri.path(),
+        uri.path_and_query().map(|p| p.as_str().len()).unwrap_or(0),
+    )
+    .map_err(map_error)?;
+    let request = parse_request(uri.query(), 0).map_err(map_error)?;
+    let script = to_scripthash("address", address, config.network_type)?;
+    let bytes = query
+        .paged_wire_response(script, &request)
+        .map_err(map_error)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .body(Body::from(bytes))
+        .map_err(|_| {
+            HttpError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "paged output response failed".into(),
+            )
+        })
 }
 
 fn handle_request(

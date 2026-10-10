@@ -9,7 +9,7 @@ use crate::util::{bincode_util, Bytes};
 /// It will also break if light mode is enabled or disabled.
 // 1 = Original DB (since fork from Blockstream)
 // 2 = Add tx position to TxHistory rows and place Spending before Funding
-static DB_VERSION: u32 = 2;
+pub(crate) const DB_VERSION: u32 = 2;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct DBRow {
@@ -139,6 +139,61 @@ pub struct DB {
     db: rocksdb::DB,
 }
 
+/// Error-preserving snapshots used only by the new bounded read lane.
+#[cfg(not(feature = "liquid"))]
+pub struct BoundedSnapshot<'a> {
+    snapshot: rocksdb::Snapshot<'a>,
+}
+#[cfg(not(feature = "liquid"))]
+impl BoundedSnapshot<'_> {
+    pub fn next_record(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+    ) -> Result<Option<DBRow>, super::paged_outputs::PageError> {
+        use super::paged_outputs::{PageError, KEY_LIMIT};
+        if prefix.is_empty() || prefix.len() > KEY_LIMIT {
+            return Err(PageError::Contract);
+        }
+        let start = match after {
+            Some(key) => {
+                if key.len() > KEY_LIMIT || !key.starts_with(prefix) {
+                    return Err(PageError::Contract);
+                }
+                // Exact exclusive full-key seek. This also preserves descendants
+                // of a shorter key; there is no height+skip scan.
+                let mut next = key.to_vec();
+                next.push(0);
+                next
+            }
+            None => prefix.to_vec(),
+        };
+        // A fresh raw iterator performs ONLY this bounded exact seek. Using
+        // DBIterator::next would advance after returning a row and could hide
+        // an advancement error when the per-record iterator is then dropped.
+        let mut iter = self.snapshot.raw_iterator();
+        iter.seek(&start);
+        iter.status().map_err(|_| PageError::Storage)?;
+        if !iter.valid() {
+            return Ok(None);
+        }
+        let key = iter.key().ok_or(PageError::Storage)?;
+        let value = iter.value().ok_or(PageError::Storage)?;
+        if !key.starts_with(prefix) {
+            return Ok(None);
+        }
+        if key.len() > KEY_LIMIT || !value.is_empty() {
+            return Err(PageError::Contract);
+        }
+        let row = DBRow {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        };
+        iter.status().map_err(|_| PageError::Storage)?;
+        Ok(Some(row))
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum DBFlush {
     Disable,
@@ -152,6 +207,13 @@ impl DB {
         };
         db.verify_compatibility(config);
         db
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    pub fn bounded_snapshot(&self) -> BoundedSnapshot<'_> {
+        BoundedSnapshot {
+            snapshot: self.db.snapshot(),
+        }
     }
 
     pub fn full_compaction(&self) {
@@ -263,6 +325,25 @@ impl DB {
         let mut opts = rocksdb::WriteOptions::new();
         opts.set_sync(true);
         self.db.put_opt(key, value, &opts).unwrap();
+    }
+
+    /// Added qualification-only point read: no unwrap/panic and no unbounded
+    /// value copy. Preserve every original getter and its legacy error policy.
+    pub fn qualified_get(
+        &self,
+        key: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Bytes>, super::qualification::QualifiedReadError> {
+        use super::qualification::QualifiedReadError;
+        let value = self
+            .db
+            .get_pinned(key)
+            .map_err(|_| QualifiedReadError::Storage)?;
+        match value {
+            Some(bytes) if bytes.len() <= maximum => Ok(Some(bytes.to_vec())),
+            Some(_) => Err(QualifiedReadError::Contract),
+            None => Ok(None),
+        }
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {

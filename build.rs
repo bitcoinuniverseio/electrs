@@ -5,6 +5,7 @@ fn main() {
 
     // 1. Rerun build script if we pass a new GIT_HASH
     println!("cargo:rerun-if-env-changed=GIT_HASH");
+    println!("cargo:rerun-if-env-changed=ELECTRS_SOURCE_REVISION");
 
     // 2. Only do git based reruns if git directory exists
     if Path::new(".git").exists() {
