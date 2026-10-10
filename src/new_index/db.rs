@@ -304,13 +304,18 @@ impl DB {
         self.db.write_opt(batch, &opts).unwrap();
     }
 
-    pub fn delete(&self, keys: Vec<Vec<u8>>) {
-        debug!("deleting {} rows from {:?}", keys.len(), self.db);
+    // One atomic batch: a failed deletion must not leave a partially removed
+    // block while callers advance their in-memory or persisted markers.
+    pub fn delete(&self, keys: Vec<Vec<u8>>) -> crate::errors::Result<()> {
+        use crate::errors::ResultExt;
+        debug!("deleting {} DB rows", keys.len());
+        let mut batch = rocksdb::WriteBatch::default();
         for key in keys {
-            let _ = self.db.delete(key).inspect_err(|err| {
-                warn!("Error while deleting DB row: {err}");
-            });
+            batch.delete(key);
         }
+        self.db
+            .write(batch)
+            .chain_err(|| "failed to delete DB batch")
     }
 
     pub fn flush(&self) {
@@ -406,6 +411,51 @@ pub fn open_raw_db<T: rocksdb::ThreadMode>(
         }
         OpenMode::ReadWrite => {
             rocksdb::DBWithThreadMode::<T>::open(&db_opts, path).expect("failed to open RocksDB")
+        }
+    }
+}
+
+#[cfg(test)]
+mod atomic_delete_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_batch_removes_all_requested_keys_and_preserves_others() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = DB {
+            db: rocksdb::DB::open_default(directory.path()).unwrap(),
+        };
+        for key in [b"a", b"b", b"t"] {
+            db.db.put(key, b"value").unwrap();
+        }
+        db.delete(vec![b"a".to_vec(), b"b".to_vec()]).unwrap();
+        assert!(db.db.get(b"a").unwrap().is_none());
+        assert!(db.db.get(b"b").unwrap().is_none());
+        assert_eq!(db.db.get(b"t").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn failed_readonly_batch_is_error_and_preserves_every_row_and_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let db = rocksdb::DB::open_default(directory.path()).unwrap();
+            for key in [b"a", b"b", b"t"] {
+                db.put(key, b"value").unwrap();
+            }
+        }
+        let db = DB {
+            db: rocksdb::DB::open_for_read_only(
+                &rocksdb::Options::default(),
+                directory.path(),
+                false,
+            )
+            .unwrap(),
+        };
+        assert!(db
+            .delete(vec![b"a".to_vec(), b"b".to_vec(), b"t".to_vec()])
+            .is_err());
+        for key in [b"a", b"b", b"t"] {
+            assert_eq!(db.db.get(key).unwrap(), Some(b"value".to_vec()));
         }
     }
 }
