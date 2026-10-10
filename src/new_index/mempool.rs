@@ -412,7 +412,10 @@ impl Mempool {
         &self,
         hash: &[u8],
         offset: usize,
-    ) -> Result<Option<super::paged_outputs::MempoolRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::MempoolRecord>,
+        super::paged_outputs::PageError,
+    > {
         use super::paged_outputs::{Funding, MempoolRecord, PageError};
         let info = match self
             .history
