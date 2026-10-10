@@ -56,7 +56,7 @@ impl super::paged_outputs::PageSource for PagedQuerySnapshot<'_> {
     fn valid(
         &self,
         scope: &super::paged_outputs::ReadScope,
-    ) -> Result<(), super::paged_outputs::PageError> {
+    ) -> std::result::Result<(), super::paged_outputs::PageError> {
         use super::paged_outputs::PageError;
         if scope != &self.scope {
             return Err(PageError::Contract);
@@ -75,25 +75,36 @@ impl super::paged_outputs::PageSource for PagedQuerySnapshot<'_> {
     fn history(
         &self,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::HistoryRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::HistoryRecord>,
+        super::paged_outputs::PageError,
+    > {
         self.chain.history(after)
     }
     fn confirmation(
         &self,
         txid: &Txid,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::ConfirmationRecord>, super::paged_outputs::PageError>
-    {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::ConfirmationRecord>,
+        super::paged_outputs::PageError,
+    > {
         self.chain.confirmation(txid, after)
     }
     fn spend(
         &self,
         point: &OutPoint,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::SpendRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::SpendRecord>,
+        super::paged_outputs::PageError,
+    > {
         self.chain.spend(point, after)
     }
-    fn mempool_spent(&self, point: &OutPoint) -> Result<bool, super::paged_outputs::PageError> {
+    fn mempool_spent(
+        &self,
+        point: &OutPoint,
+    ) -> std::result::Result<bool, super::paged_outputs::PageError> {
         use super::paged_outputs::PageError;
         let mempool = self
             .query
@@ -110,7 +121,10 @@ impl super::paged_outputs::PageSource for PagedQuerySnapshot<'_> {
     fn mempool(
         &self,
         offset: usize,
-    ) -> Result<Option<super::paged_outputs::MempoolRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::MempoolRecord>,
+        super::paged_outputs::PageError,
+    > {
         use super::paged_outputs::PageError;
         let mempool = self
             .query
@@ -206,7 +220,7 @@ impl Query {
         cursor: Option<&super::paged_outputs::PageCursor>,
         expected: &super::page_http::ExpectedScope,
         deadline: Instant,
-    ) -> Result<
+    ) -> std::result::Result<
         (
             super::paged_outputs::OutputPage,
             super::paged_outputs::PageCursor,
@@ -309,7 +323,7 @@ impl Query {
         &self,
         script_hash: super::schema::FullHash,
         request: &super::page_http::PageRequest,
-    ) -> Result<Vec<u8>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<Vec<u8>, super::paged_outputs::PageError> {
         use super::paged_outputs::{PageError, BODY_LIMIT};
         // Synchronous owner keeps lease through all actual IO, serialization and
         // final fences. Client disconnect/deadline cannot release it early.
