@@ -25,10 +25,21 @@ def headroom(report):
         raise ValueError('small proof requires1GiB memory and temporary disk headroom')
     maxima = {}
     for kind, maximum in [('cpu', 25.0), ('io', 5.0)]:
-        values = re.findall(r'avg(?:10|60|300)=([0-9]+(?:\.[0-9]+)?)', report['pressure'][kind])
-        if not values or any(not 0 <= float(value) <= 100 for value in values):
-            raise ValueError('unknown pressure metadata')
-        maxima[kind] = max(float(value) for value in values)
+        rows = {}
+        for line in report['pressure'][kind].splitlines():
+            parts = line.split()
+            if not parts or parts[0] not in ['some', 'full'] or parts[0] in rows:
+                raise ValueError('unknown pressure rows')
+            fields = dict(part.split('=', 1) for part in parts[1:])
+            if set(fields) != {'avg10', 'avg60', 'avg300', 'total'}:
+                raise ValueError('incomplete pressure metadata')
+            values = [float(fields[key]) for key in ['avg10', 'avg60', 'avg300']]
+            if any(not 0 <= value <= 100 for value in values):
+                raise ValueError('unknown pressure metadata')
+            rows[parts[0]] = values
+        if set(rows) != {'some', 'full'}:
+            raise ValueError('incomplete pressure rows')
+        maxima[kind] = max(value for values in rows.values() for value in values)
         if maxima[kind] > maximum:
             raise ValueError('small proof pressure headroom unavailable')
     return {'minimumAvailableMemoryKiB': 1048576, 'minimumTemporaryDiskBytes': 1073741824,

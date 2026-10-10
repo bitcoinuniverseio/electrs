@@ -16,8 +16,8 @@ spec.loader.exec_module(p)
 class ConfinementSourceTests(unittest.TestCase):
     def report(self):
         return {'memoryKiB': {'MemAvailable': 1048576}, 'freeTempBytes': 1073741824,
-                'pressure': {'cpu': 'some avg10=25.00 avg60=25.00 avg300=25.00',
-                             'io': 'some avg10=5.00 avg60=5.00 avg300=5.00'}}
+                'pressure': {'cpu': 'some avg10=25.00 avg60=25.00 avg300=25.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0',
+                             'io': 'some avg10=5.00 avg60=5.00 avg300=5.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0'}}
 
     def test_small_headroom_exact_boundary_is_not_full_build_admission(self):
         result = p.headroom(self.report())
@@ -29,7 +29,7 @@ class ConfinementSourceTests(unittest.TestCase):
             if kind == 'memory': value['memoryKiB']['MemAvailable'] -= 1
             elif kind == 'disk': value['freeTempBytes'] -= 1
             elif kind == 'unknown': value['pressure']['io'] = 'unknown'
-            else: value['pressure'][kind] = 'some avg10=26.00 avg60=26.00 avg300=26.00'
+            else: value['pressure'][kind] = 'some avg10=26.00 avg60=26.00 avg300=26.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0'
             with self.subTest(kind=kind), patch('sys.argv', ['confinement-proof.py', '--run-proof']), \
                     patch.object(p.scope.metadata, 'collect', return_value=value), \
                     patch.object(p.pathlib.Path, 'mkdir') as mkdir, \
@@ -103,9 +103,20 @@ class ConfinementSourceTests(unittest.TestCase):
         self.assertIn('clearenv()', c)
         self.assertIn('execve(self, args, clean)', c)
 
-    def test_current_workflow_does_not_launch_prototype(self):
+    def test_incomplete_pressure_cannot_admit_the_small_proof(self):
+        for raw in ['some avg10=0 avg60=0 avg300=0 total=0',
+                    'some avg10=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0',
+                    'some avg10=0 avg60=0 avg300=0 total=0\nsome avg10=0 avg60=0 avg300=0 total=0']:
+            value = self.report(); value['pressure']['io'] = raw
+            with self.subTest(raw=raw), self.assertRaises(ValueError): p.headroom(value)
+
+    def test_current_workflow_runs_only_the_owned_capped_control(self):
         raw = (HERE.parents[1] / '.github/workflows/universe-native-preflight.yml').read_text()
-        self.assertNotIn('confinement-proof.py --run-proof', raw)
+        self.assertIn('confinement-proof.py --run-proof', raw)
+        self.assertIn("github.repository == 'bitcoinuniverseio/electrs'", raw)
+        self.assertIn('timeout-minutes: 5', raw)
+        self.assertNotIn('cargo build', raw)
+        self.assertNotIn('sudo ', raw)
 
 
 if __name__ == '__main__':
