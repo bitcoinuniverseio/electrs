@@ -1,4 +1,4 @@
-name: Universe storage enforcement capability metadata only
+name: Universe isolated helper ABI metadata only
 
 on:
   workflow_dispatch:
@@ -45,10 +45,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Observe existing storage enforcement facilities without actions
+      - name: Observe exact existing host library ABI without helper execution
         shell: bash
         env:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3.12 -B -I -S scripts/universe/storage-enforcement-metadata.py --observe-owned-storage
+          /usr/bin/python3.12 -B -I -S scripts/universe/helper-runtime-metadata.py --observe-owned-runtime
