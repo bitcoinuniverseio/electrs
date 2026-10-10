@@ -9,6 +9,7 @@ name: Compile Check and Lint
 
 jobs:
   check:
+    if: github.repository == 'mempool/electrs'
     name: Compile Check
     runs-on: mempool-ci
     steps:
@@ -20,6 +21,7 @@ jobs:
       - run: cargo check --all-features
 
   fmt:
+    if: github.repository == 'mempool/electrs'
     name: Formatter
     runs-on: mempool-ci
     steps:
@@ -31,6 +33,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   test:
+    if: github.repository == 'mempool/electrs'
     name: Run Tests
     runs-on: mempool-ci
     steps:
@@ -42,6 +45,7 @@ jobs:
       - run: cargo test --lib --all-features
 
   compile-freebsd:
+    if: github.repository == 'mempool/electrs'
     runs-on: mempool-ci
     name: Run Compile Checks in FreeBSD
     env:
@@ -85,6 +89,7 @@ jobs:
           mv ~/.cargo/git ./.cargohome/
 
   clippy:
+    if: github.repository == 'mempool/electrs'
     name: Linter
     runs-on: mempool-ci
     needs: [check]
@@ -95,7 +100,7 @@ jobs:
           '-F electrum-discovery',
           '-F liquid',
           '-F electrum-discovery,liquid',
-        ]
+          ]
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust

@@ -8,6 +8,7 @@ on:
 
 jobs:
   update-project-status:
+    if: github.repository == 'mempool/electrs'
     runs-on: ubuntu-latest
     steps:
       - name: Update Project Status to Review Needed
