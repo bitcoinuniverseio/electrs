@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::thread;
 
-use crate::chain::{Block, BlockHash};
+use crate::chain::{Block, BlockHash, BlockSizeCompat};
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
@@ -92,7 +92,7 @@ pub fn bitcoind_sequential_fetcher(
             .zip(entries)
             .map(|(block, entry)| BlockEntry {
                 entry: entry.clone(),
-                size: block.size() as u32,
+                size: block.get_block_size() as u32,
                 block,
             })
             .collect();
@@ -187,7 +187,7 @@ fn bitcoind_fetcher(
                     .zip(entries)
                     .map(|(block, entry)| BlockEntry {
                         entry: entry.clone(), // TODO: remove this clone()
-                        size: block.size() as u32,
+                        size: block.get_block_size() as u32,
                         block,
                     })
                     .collect();
@@ -343,12 +343,7 @@ fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
         cursor.set_position(end);
     }
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(0) // CPU-bound
-        .thread_name(|i| format!("parse-blocks-{}", i))
-        .build()
-        .unwrap();
-    Ok(pool.install(|| {
+    Ok(super::THREAD_POOL.install(|| {
         slices
             .into_par_iter()
             .map(|(slice, size)| (deserialize(slice).expect("failed to parse Block"), size))

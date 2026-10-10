@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(feature = "electrum-discovery")]
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::IpAddr;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
@@ -12,10 +11,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use error_chain::ChainedError;
 use hex;
+use ppp::PartialResult;
 use serde_json::{from_str, Value};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,7 @@ use elements::encode::serialize;
 
 use crate::chain::Txid;
 use crate::config::{Config, VERSION_STRING};
-use crate::electrum::{get_electrum_height, ProtocolVersion};
+use crate::electrum::{get_electrum_height, ProtocolVersion, ServerFeatures};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
@@ -40,7 +41,7 @@ const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
 
 #[cfg(feature = "electrum-discovery")]
-use crate::electrum::{DiscoveryManager, ServerFeatures};
+use crate::electrum::DiscoveryManager;
 
 // TODO: Sha256dHash should be a generic hash-container (since script hash is single SHA256)
 fn hash_from_value(val: Option<&Value>) -> Result<Sha256dHash> {
@@ -74,6 +75,36 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
         return Ok(default);
     }
     bool_from_value(val, name)
+}
+
+/// Extracts the source socket address from a parsed PROXY protocol v1 header.
+fn proxy_v1_source(addresses: &ppp::v1::Addresses) -> Option<SocketAddr> {
+    match addresses {
+        ppp::v1::Addresses::Tcp4(ip) => Some(SocketAddr::new(
+            IpAddr::V4(ip.source_address),
+            ip.source_port,
+        )),
+        ppp::v1::Addresses::Tcp6(ip) => Some(SocketAddr::new(
+            IpAddr::V6(ip.source_address),
+            ip.source_port,
+        )),
+        ppp::v1::Addresses::Unknown => None,
+    }
+}
+
+/// Extracts the source socket address from a parsed PROXY protocol v2 header.
+fn proxy_v2_source(addresses: &ppp::v2::Addresses) -> Option<SocketAddr> {
+    match addresses {
+        ppp::v2::Addresses::IPv4(ip) => Some(SocketAddr::new(
+            IpAddr::V4(ip.source_address),
+            ip.source_port,
+        )),
+        ppp::v2::Addresses::IPv6(ip) => Some(SocketAddr::new(
+            IpAddr::V6(ip.source_address),
+            ip.source_port,
+        )),
+        ppp::v2::Addresses::Unspecified | ppp::v2::Addresses::Unix(_) => None,
+    }
 }
 
 // TODO: implement caching and delta updates
@@ -122,18 +153,36 @@ struct Connection {
     chan: SyncChannel<Message>,
     stats: Arc<Stats>,
     txs_limit: usize,
+    max_line_size: usize,
+    max_subscriptions: usize,
+    idle_timeout: u64,
+    last_request_at: Instant,
     die_please: Option<Receiver<()>>,
+    server_features: Arc<ServerFeatures>,
+    haproxy_depth: usize,
+    proxy_client: Option<SocketAddr>,
+    connections_per_client: usize,
+    client_counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    registered_ip: Option<IpAddr>,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
 }
 
 impl Connection {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         query: Arc<Query>,
         stream: ConnectionStream,
         stats: Arc<Stats>,
         txs_limit: usize,
+        max_line_size: usize,
+        max_subscriptions: usize,
+        idle_timeout: u64,
         die_please: Receiver<()>,
+        server_features: Arc<ServerFeatures>,
+        haproxy_depth: usize,
+        connections_per_client: usize,
+        client_counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
     ) -> Connection {
         Connection {
@@ -144,7 +193,17 @@ impl Connection {
             chan: SyncChannel::new(10),
             stats,
             txs_limit,
+            max_line_size,
+            max_subscriptions,
+            idle_timeout,
+            last_request_at: Instant::now(),
             die_please: Some(die_please),
+            server_features,
+            haproxy_depth,
+            proxy_client: None,
+            connections_per_client,
+            client_counts,
+            registered_ip: None,
             #[cfg(feature = "electrum-discovery")]
             discovery,
         }
@@ -166,13 +225,8 @@ impl Connection {
         Ok(json!(self.query.config().electrum_banner.clone()))
     }
 
-    #[cfg(feature = "electrum-discovery")]
     fn server_features(&self) -> Result<Value> {
-        let discovery = self
-            .discovery
-            .as_ref()
-            .chain_err(|| "discovery is disabled")?;
-        Ok(json!(discovery.our_features()))
+        Ok(json!(self.server_features.as_ref()))
     }
 
     fn server_donation_address(&self) -> Result<Value> {
@@ -293,6 +347,16 @@ impl Connection {
 
     fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
+
+        // Enforce per-client subscription limit (don't count re-subscriptions to the same hash)
+        if !self.status_hashes.contains_key(&script_hash)
+            && self.status_hashes.len() >= self.max_subscriptions
+        {
+            bail!(
+                "subscription limit reached ({} max per client)",
+                self.max_subscriptions
+            );
+        }
 
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
         let status_hash = get_status_hash(history_txids, &self.query)
@@ -467,9 +531,8 @@ impl Connection {
             "server.peers.subscribe" => self.server_peers_subscribe(),
             "server.ping" => Ok(Value::Null),
             "server.version" => self.server_version(),
-
-            #[cfg(feature = "electrum-discovery")]
             "server.features" => self.server_features(),
+
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(params),
 
@@ -545,14 +608,99 @@ impl Connection {
         Ok(())
     }
 
+    fn close_idle_connection(&mut self, idle_for: Duration) {
+        info!(
+            "[{}] closing idle connection after {} seconds without requests (timeout: {} seconds)",
+            self.client_string(),
+            idle_for.as_secs(),
+            self.idle_timeout,
+        );
+        self.chan.close();
+    }
+
+    /// A human-readable identifier for the connected client, preferring the
+    /// HAProxy-reported address (when present) over the direct peer address.
+    fn client_string(&self) -> String {
+        match self.proxy_client {
+            Some(addr) => format!("{} via {}", addr, self.stream.addr_string()),
+            None => self.stream.addr_string(),
+        }
+    }
+
+    /// Resolves the PROXY-protocol parse result into the client address at the
+    /// configured `electrum-haproxy-depth` layer. A depth of 0, a missing PROXY
+    /// header, or a non-existent layer all leave the client unidentified.
+    fn set_proxy_client(&mut self, addresses: Option<Vec<SocketAddr>>) {
+        self.proxy_client = match (self.haproxy_depth, addresses) {
+            (0, _) | (_, None) => None,
+            (depth, Some(addrs)) => addrs.get(depth - 1).copied(),
+        };
+    }
+
+    /// Registers this connection against its client key (the HAProxy-reported IP
+    /// when available, otherwise the direct peer IP) and enforces the
+    /// `electrum-connections-per-client` limit. Returns an error if the limit has
+    /// already been reached, in which case the connection must be closed.
+    fn register_client(&mut self) -> Result<()> {
+        if self.connections_per_client == 0 {
+            // Per-client limit disabled.
+            return Ok(());
+        }
+        let key = match self
+            .proxy_client
+            .map(|addr| addr.ip())
+            .or_else(|| self.stream.direct_ip())
+        {
+            Some(key) => key,
+            // No usable client key (e.g. a unix socket with no PROXY header).
+            None => return Ok(()),
+        };
+
+        let mut counts = self.client_counts.lock().unwrap();
+        let count = counts.entry(key).or_insert(0);
+        if *count >= self.connections_per_client {
+            bail!(
+                "too many connections from client {} ({} max per client)",
+                key,
+                self.connections_per_client
+            );
+        }
+        *count += 1;
+        self.registered_ip = Some(key);
+        Ok(())
+    }
+
+    /// Releases this connection's slot in the per-client connection counter.
+    fn unregister_client(&mut self) {
+        if let Some(key) = self.registered_ip.take() {
+            let mut counts = self.client_counts.lock().unwrap();
+            if let Some(count) = counts.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&key);
+                }
+            }
+        }
+    }
+
     fn handle_replies(&mut self, shutdown: crossbeam_channel::Receiver<()>) -> Result<()> {
+        let idle_timeout = Duration::from_secs(self.idle_timeout);
         loop {
+            let elapsed = self.last_request_at.elapsed();
+            if elapsed > idle_timeout {
+                self.close_idle_connection(elapsed);
+                return Ok(());
+            }
+            let remaining = idle_timeout.saturating_sub(elapsed);
+            let idle_deadline = crossbeam_channel::after(remaining);
+
             crossbeam_channel::select! {
                 recv(self.chan.receiver()) -> msg => {
                     let msg = msg.chain_err(|| "channel closed")?;
                     trace!("RPC {:?}", msg);
                     match msg {
                         Message::Request(line) => {
+                            self.last_request_at = Instant::now();
                             let result = self.handle_line(&line);
                             self.send_values(&[result])?
                         }
@@ -566,10 +714,23 @@ impl Connection {
                             self.chan.close();
                             return Ok(());
                         }
+                        Message::Proxy(addresses) => {
+                            self.set_proxy_client(addresses);
+                            if let Err(e) = self.register_client() {
+                                info!("[{}] {}", self.client_string(), e);
+                                self.chan.close();
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 recv(shutdown) -> _ => {
                     self.chan.close();
+                    return Ok(());
+                }
+                recv(idle_deadline) -> _ => {
+                    let idle_for = self.last_request_at.elapsed();
+                    self.close_idle_connection(idle_for);
                     return Ok(());
                 }
             }
@@ -620,18 +781,134 @@ impl Connection {
         }
     }
 
+    /// Reads and parses any PROXY-protocol (HAProxy) headers found at the very
+    /// start of the connection. Returns the source address reported by each
+    /// proxy layer (outermost first), or `None` if no PROXY header was present,
+    /// together with any bytes that were read past the header(s) and belong to
+    /// the Electrum request stream.
+    fn read_proxy_headers(
+        stream: &mut ConnectionStream,
+    ) -> Result<(Option<Vec<SocketAddr>>, Vec<u8>)> {
+        // Upper bound on how much we are willing to buffer while looking for
+        // PROXY headers, to avoid unbounded memory use from a slow/malicious peer.
+        const MAX_PROXY_HEADER_SIZE: usize = 4096;
+
+        enum Step {
+            Parsed(usize, Option<SocketAddr>),
+            NeedMore,
+            Done,
+        }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        let mut saw_proxy = false;
+        let mut chunk = [0u8; 256];
+
+        loop {
+            // Parse as many complete, stacked PROXY headers as the buffer allows.
+            let need_more = loop {
+                if buf.is_empty() {
+                    break true;
+                }
+                let step = match ppp::HeaderResult::parse(&buf) {
+                    ppp::HeaderResult::V2(Ok(header)) => {
+                        Step::Parsed(header.len(), proxy_v2_source(&header.addresses))
+                    }
+                    ppp::HeaderResult::V1(Ok(header)) => {
+                        Step::Parsed(header.header.len(), proxy_v1_source(&header.addresses))
+                    }
+                    other => {
+                        if other.is_incomplete() {
+                            Step::NeedMore
+                        } else {
+                            Step::Done
+                        }
+                    }
+                };
+                match step {
+                    Step::Parsed(consumed, src) => {
+                        saw_proxy = true;
+                        if let Some(src) = src {
+                            addrs.push(src);
+                        }
+                        if consumed == 0 || consumed > buf.len() {
+                            // Defensive: never spin forever on a degenerate parse.
+                            break false;
+                        }
+                        buf.drain(..consumed);
+                    }
+                    Step::NeedMore => break true,
+                    Step::Done => break false,
+                }
+            };
+
+            if !need_more {
+                break;
+            }
+            if buf.len() > MAX_PROXY_HEADER_SIZE {
+                bail!(
+                    "PROXY protocol header too large (exceeds {} bytes)",
+                    MAX_PROXY_HEADER_SIZE
+                );
+            }
+            let n = stream
+                .read(&mut chunk)
+                .chain_err(|| "failed to read PROXY protocol header")?;
+            if n == 0 {
+                // EOF before another complete header; stop with what we have.
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+
+        let result = if saw_proxy { Some(addrs) } else { None };
+        Ok((result, buf))
+    }
+
     fn handle_requests(
-        mut reader: BufReader<ConnectionStream>,
+        stream: ConnectionStream,
         tx: crossbeam_channel::Sender<Message>,
+        max_line_size: usize,
     ) -> Result<()> {
+        let mut stream = stream;
+
+        // Consume any PROXY-protocol (HAProxy) headers at the very start of the
+        // connection before treating the stream as Electrum requests. We always
+        // consume them — even when HAProxy support is disabled
+        // (`electrum-haproxy-depth = 0`) — so that PROXY headers sent by an
+        // accidentally-misconfigured upstream are stripped instead of corrupting
+        // the Electrum request parser.
+        //
+        // Crucially, `read_proxy_headers` only ever buffers bytes it has already
+        // read from the socket: when no PROXY header is present it returns those
+        // bytes as `leftover` so the start of the first Electrum request is
+        // preserved rather than discarded.
+        //
+        // The parsed addresses are forwarded over the channel; whether they are
+        // actually used to identify the client is decided later based on the
+        // configured `electrum-haproxy-depth` (a depth of 0 ignores them).
+        let (proxy_addrs, leftover) = Connection::read_proxy_headers(&mut stream)?;
+        tx.send(Message::Proxy(proxy_addrs))
+            .chain_err(|| "channel closed")?;
+
+        let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
         loop {
             let mut line = Vec::<u8>::new();
-            reader
+            // Read up to max_line_size + 1 bytes to detect oversized lines
+            let mut limited = (&mut reader).take((max_line_size as u64).saturating_add(1));
+            limited
                 .read_until(b'\n', &mut line)
                 .chain_err(|| "failed to read a request")?;
             if line.is_empty() {
                 tx.send(Message::Done).chain_err(|| "channel closed")?;
                 return Ok(());
+            } else if line.len() > max_line_size {
+                let _ = tx.send(Message::Done);
+                bail!(
+                    "request line too large ({} bytes, max is {})",
+                    line.len(),
+                    max_line_size
+                )
             } else {
                 if line.starts_with(&[22, 3, 1]) {
                     // (very) naive SSL handshake detection
@@ -653,7 +930,7 @@ impl Connection {
 
     pub fn run(mut self) {
         self.stats.clients.inc();
-        let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
+        let stream = self.stream.try_clone().expect("failed to clone TcpStream");
         let tx = self.chan.sender();
 
         let die_please = self.die_please.take().unwrap();
@@ -671,11 +948,14 @@ impl Connection {
             let _ = reply_killer.send(());
         });
 
-        let child = spawn_thread("reader", || Connection::handle_requests(reader, tx));
+        let max_line_size = self.max_line_size;
+        let child = spawn_thread("reader", move || {
+            Connection::handle_requests(stream, tx, max_line_size)
+        });
         if let Err(e) = self.handle_replies(reply_receiver) {
             error!(
                 "[{}] connection handling failed: {}",
-                self.stream.addr_string(),
+                self.client_string(),
                 e.display_chain().to_string()
             );
         }
@@ -683,8 +963,9 @@ impl Connection {
         self.stats
             .subscriptions
             .sub(self.status_hashes.len() as i64);
+        self.unregister_client();
 
-        let addr = self.stream.addr_string();
+        let addr = self.client_string();
         debug!("[{}] shutting down connection", addr);
         // Drop the Arc so that the stream properly closes.
         drop(arc_stream);
@@ -742,6 +1023,11 @@ pub enum Message {
     Request(String),
     PeriodicUpdate,
     Done,
+    /// The result of parsing zero or more PROXY-protocol (HAProxy) headers at
+    /// the start of the connection. `None` means no PROXY header was present;
+    /// `Some(addrs)` holds the source address reported by each proxy layer,
+    /// outermost first.
+    Proxy(Option<Vec<SocketAddr>>),
 }
 
 pub enum Notification {
@@ -830,11 +1116,10 @@ impl RPC {
 
         let notification = Channel::unbounded();
 
-        // Discovery is enabled when electrum-public-hosts is set
-        #[cfg(feature = "electrum-discovery")]
-        let discovery = config.electrum_public_hosts.clone().map(|hosts| {
+        let server_features = {
             use crate::chain::genesis_hash;
-            let features = ServerFeatures {
+            let hosts = config.electrum_public_hosts.clone().unwrap_or_default();
+            Arc::new(ServerFeatures {
                 hosts,
                 server_version: VERSION_STRING.clone(),
                 genesis_hash: genesis_hash(config.network_type),
@@ -842,10 +1127,15 @@ impl RPC {
                 protocol_max: PROTOCOL_VERSION,
                 hash_function: "sha256".into(),
                 pruning: None,
-            };
+            })
+        };
+
+        // Discovery is enabled when electrum-public-hosts is set
+        #[cfg(feature = "electrum-discovery")]
+        let discovery = config.electrum_public_hosts.as_ref().map(|_hosts| {
             let discovery = Arc::new(DiscoveryManager::new(
                 config.network_type,
-                features,
+                server_features.as_ref().clone(),
                 PROTOCOL_VERSION,
                 config.electrum_announce,
                 config.tor_proxy,
@@ -855,12 +1145,22 @@ impl RPC {
         });
 
         let txs_limit = config.electrum_txs_limit;
+        let max_line_size = config.electrum_max_line_size;
+        let max_subscriptions = config.electrum_max_subscriptions;
+        let max_clients = config.electrum_max_clients;
+        let idle_timeout = config.electrum_idle_timeout;
+        let haproxy_depth = config.electrum_haproxy_depth;
+        let connections_per_client = config.electrum_connections_per_client;
 
         RPC {
             notification: notification.sender(),
             server: Some(spawn_thread("rpc", move || {
                 let senders =
                     Arc::new(Mutex::new(Vec::<crossbeam_channel::Sender<Message>>::new()));
+                // Tracks the number of live connections per client (keyed by the
+                // HAProxy-reported address when available, otherwise the peer IP).
+                let client_counts: Arc<Mutex<HashMap<IpAddr, usize>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
 
                 let acceptor_shutdown = Channel::unbounded();
                 let acceptor_shutdown_sender = acceptor_shutdown.sender();
@@ -872,15 +1172,39 @@ impl RPC {
                     acceptor_shutdown_sender,
                 );
 
-                let mut threads = HashMap::new();
+                let mut threads: HashMap<thread::ThreadId, (thread::JoinHandle<()>, Sender<()>)> =
+                    HashMap::new();
                 let (garbage_sender, garbage_receiver) = crossbeam_channel::unbounded();
 
                 while let Some(stream) = acceptor.receiver().recv().unwrap() {
+                    // Clean up finished threads before checking connection limit
+                    while let Ok(id) = garbage_receiver.try_recv() {
+                        if let Some((thread, killer)) = threads.remove(&id) {
+                            let _ = killer.send(());
+                            if let Err(error) = thread.join() {
+                                error!("failed to join {:?}: {:?}", id, error);
+                            }
+                        }
+                    }
+
+                    // Enforce maximum connection limit
+                    if threads.len() >= max_clients {
+                        warn!(
+                            "[{}] rejecting connection: max clients reached ({}/{})",
+                            stream.addr_string(),
+                            threads.len(),
+                            max_clients
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+
                     let addr = stream.addr_string();
                     // explicitely scope the shadowed variables for the new thread
                     let query = Arc::clone(&query);
                     let senders = Arc::clone(&senders);
                     let stats = Arc::clone(&stats);
+                    let client_counts = Arc::clone(&client_counts);
                     let garbage_sender = garbage_sender.clone();
 
                     // Kill the peers properly
@@ -889,6 +1213,7 @@ impl RPC {
 
                     #[cfg(feature = "electrum-discovery")]
                     let discovery = discovery.clone();
+                    let server_features = Arc::clone(&server_features);
 
                     let spawned = spawn_thread("peer", move || {
                         let addr = stream.addr_string();
@@ -898,7 +1223,14 @@ impl RPC {
                             stream,
                             stats,
                             txs_limit,
+                            max_line_size,
+                            max_subscriptions,
+                            idle_timeout,
                             peace_receiver,
+                            server_features,
+                            haproxy_depth,
+                            connections_per_client,
+                            client_counts,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                         );
@@ -911,15 +1243,6 @@ impl RPC {
 
                     trace!("[{}] spawned {:?}", addr, spawned.thread().id());
                     threads.insert(spawned.thread().id(), (spawned, killer));
-                    while let Ok(id) = garbage_receiver.try_recv() {
-                        if let Some((thread, killer)) = threads.remove(&id) {
-                            trace!("[{}] joining {:?}", addr, id);
-                            let _ = killer.send(());
-                            if let Err(error) = thread.join() {
-                                error!("failed to join {:?}: {:?}", id, error);
-                            }
-                        }
-                    }
                 }
                 // Drop these
                 drop(acceptor);
@@ -1078,6 +1401,15 @@ impl ConnectionStream {
         match self {
             ConnectionStream::Tcp(_, a) => format!("{a}"),
             ConnectionStream::Unix(_, a, _) => format!("{a:?}"),
+        }
+    }
+
+    /// The direct peer IP address, if this is a TCP connection. Unix-socket
+    /// connections have no IP and return `None`.
+    fn direct_ip(&self) -> Option<IpAddr> {
+        match self {
+            ConnectionStream::Tcp(_, a) => Some(a.ip()),
+            ConnectionStream::Unix(..) => None,
         }
     }
 

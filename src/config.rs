@@ -66,14 +66,19 @@ pub struct Config {
     pub rest_default_max_address_summary_txs: usize,
     pub rest_max_mempool_page_size: usize,
     pub rest_max_mempool_txid_page_size: usize,
+    pub electrum_max_line_size: usize,
+    pub electrum_max_subscriptions: usize,
+    pub electrum_max_clients: usize,
+    pub electrum_idle_timeout: u64,
+    pub electrum_haproxy_depth: usize,
+    pub electrum_connections_per_client: usize,
+    pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
     pub asset_db_path: Option<PathBuf>,
 
-    #[cfg(feature = "electrum-discovery")]
-    pub electrum_public_hosts: Option<crate::electrum::ServerHosts>,
     #[cfg(feature = "electrum-discovery")]
     pub electrum_announce: bool,
     #[cfg(feature = "electrum-discovery")]
@@ -282,6 +287,36 @@ impl Config {
                     .long("electrum-banner")
                     .help("Welcome banner for the Electrum server, shown in the console to clients.")
                     .takes_value(true)
+            ).arg(
+                Arg::with_name("electrum_max_line_size")
+                    .long("electrum-max-line-size")
+                    .help("Maximum size of a single Electrum request line in bytes (default: 1 MiB).")
+                    .default_value("1048576")
+            ).arg(
+                Arg::with_name("electrum_max_subscriptions")
+                    .long("electrum-max-subscriptions")
+                    .help("Maximum number of scripthash subscriptions per client connection.")
+                    .default_value("100")
+            ).arg(
+                Arg::with_name("electrum_max_clients")
+                    .long("electrum-max-clients")
+                    .help("Maximum number of concurrent Electrum client connections.")
+                    .default_value("10")
+            ).arg(
+                Arg::with_name("electrum_idle_timeout")
+                    .long("electrum-idle-timeout")
+                    .help("Maximum idle time in seconds since the last client request before disconnecting the Electrum connection.")
+                    .default_value("600")
+            ).arg(
+                Arg::with_name("electrum_haproxy_depth")
+                    .long("electrum-haproxy-depth")
+                    .help("Which HAProxy PROXY-protocol header layer identifies the real client IP. 0 disables PROXY-protocol detection; 1 uses the first (outermost) address, 2 the second, and so on. If the requested layer or any PROXY header is absent, no client IP is associated with the connection.")
+                    .default_value("0")
+            ).arg(
+                Arg::with_name("electrum_connections_per_client")
+                    .long("electrum-connections-per-client")
+                    .help("Maximum number of concurrent Electrum connections allowed per client (keyed by the HAProxy-reported address when available, otherwise the peer IP). 0 disables the per-client limit.")
+                    .default_value("10")
             );
 
         #[cfg(unix)]
@@ -501,6 +536,8 @@ impl Config {
         let electrum_public_hosts = m
             .value_of("electrum_public_hosts")
             .map(|s| serde_json::from_str(s).expect("invalid --electrum-public-hosts"));
+        #[cfg(not(feature = "electrum-discovery"))]
+        let electrum_public_hosts: Option<crate::electrum::ServerHosts> = None;
 
         let mut log = stderrlog::new();
         log.verbosity(m.occurrences_of("verbosity") as usize);
@@ -552,6 +589,16 @@ impl Config {
                 "rest_max_mempool_txid_page_size",
                 usize
             ),
+            electrum_max_line_size: value_t_or_exit!(m, "electrum_max_line_size", usize),
+            electrum_max_subscriptions: value_t_or_exit!(m, "electrum_max_subscriptions", usize),
+            electrum_max_clients: value_t_or_exit!(m, "electrum_max_clients", usize),
+            electrum_idle_timeout: value_t_or_exit!(m, "electrum_idle_timeout", u64),
+            electrum_haproxy_depth: value_t_or_exit!(m, "electrum_haproxy_depth", usize),
+            electrum_connections_per_client: value_t_or_exit!(
+                m,
+                "electrum_connections_per_client",
+                usize
+            ),
             jsonrpc_import: m.is_present("jsonrpc_import"),
             light_mode: m.is_present("light_mode"),
             main_loop_delay: value_t_or_exit!(m, "main_loop_delay", u64),
@@ -581,7 +628,6 @@ impl Config {
             #[cfg(feature = "liquid")]
             asset_db_path,
 
-            #[cfg(feature = "electrum-discovery")]
             electrum_public_hosts,
             #[cfg(feature = "electrum-discovery")]
             electrum_announce: m.is_present("electrum_announce"),

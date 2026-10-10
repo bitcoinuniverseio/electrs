@@ -1,11 +1,11 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use std::{cmp, fs, path, thread};
 
 use serde_json::Value as JsonValue;
 
-use bitcoin::hashes::hex::FromHex;
 use elements::AssetId;
 
 use crate::errors::*;
@@ -14,6 +14,8 @@ use crate::errors::*;
 // (in number of hex characters, not bytes)
 
 const DIR_PARTITION_LEN: usize = 2;
+const SEARCH_SORT_CANDIDATE_LIMIT: usize = 2000;
+
 pub struct AssetRegistry {
     directory: path::PathBuf,
     assets_cache: HashMap<AssetId, (SystemTime, AssetMeta)>,
@@ -53,6 +55,39 @@ impl AssetRegistry {
         )
     }
 
+    pub fn search(&self, query: &str, limit: usize) -> Vec<AssetEntry<'_>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return vec![];
+        }
+
+        let (mut results, candidates) = search_by(
+            self.assets_cache
+                .iter()
+                .map(|(asset_id, (_, metadata))| (asset_id, metadata)),
+            query,
+            limit,
+            |metadata| metadata.ticker.as_deref(),
+        );
+
+        if results.len() < limit {
+            let (name_matches, candidates) =
+                search_by(candidates, query, limit - results.len(), |metadata| {
+                    Some(&metadata.name)
+                });
+            results.extend(name_matches);
+
+            if results.len() < limit {
+                let (domain_matches, _) =
+                    search_by(candidates, query, limit - results.len(), AssetMeta::domain);
+                results.extend(domain_matches);
+            }
+        }
+
+        results.truncate(limit);
+        results
+    }
+
     pub fn fs_sync(&mut self) -> Result<()> {
         for entry in fs::read_dir(&self.directory).chain_err(|| "failed reading asset dir")? {
             let entry = entry.chain_err(|| "invalid fh")?;
@@ -70,7 +105,7 @@ impl AssetRegistry {
                     continue;
                 }
 
-                let asset_id = AssetId::from_hex(
+                let asset_id = AssetId::from_str(
                     path.file_stem()
                         .unwrap() // cannot fail if extension() succeeded
                         .to_str()
@@ -126,7 +161,7 @@ pub struct AssetMeta {
 }
 
 impl AssetMeta {
-    fn domain(&self) -> Option<&str> {
+    pub(crate) fn domain(&self) -> Option<&str> {
         self.entity["domain"].as_str()
     }
 }
@@ -191,4 +226,73 @@ fn lc_cmp_opt(a: &Option<String>, b: &Option<String>) -> cmp::Ordering {
     a.as_ref()
         .map(|a| a.to_lowercase())
         .cmp(&b.as_ref().map(|b| b.to_lowercase()))
+}
+
+fn search_by<'a, I, F>(
+    candidates: I,
+    query: &str,
+    limit: usize,
+    field: F,
+) -> (Vec<AssetEntry<'a>>, Vec<AssetEntry<'a>>)
+where
+    I: IntoIterator<Item = AssetEntry<'a>>,
+    F: Fn(&AssetMeta) -> Option<&str>,
+{
+    let mut matches = vec![];
+    let mut remaining = vec![];
+
+    for (asset_id, metadata) in candidates {
+        let position = field(metadata).and_then(|field| {
+            // registry fields are ascii, so we don't need full unicode case-folding
+            ascii_ci_find(field, query).map(|position| (position, field))
+        });
+
+        if let Some((position, field)) = position {
+            if matches.len() >= SEARCH_SORT_CANDIDATE_LIMIT {
+                continue;
+            }
+            matches.push((position, field, asset_id, metadata));
+        } else {
+            remaining.push((asset_id, metadata));
+        }
+    }
+
+    matches.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| ascii_ci_cmp(a.1, b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+
+    (
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, asset_id, metadata)| (asset_id, metadata))
+            .collect(),
+        remaining,
+    )
+}
+
+// zero-allocation case-insensitive ASCII substring search
+// returns the byte offset of the first match
+fn ascii_ci_find(haystack: &str, needle: &str) -> Option<usize> {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+// zero-allocation case-insensitive ASCII string comparison
+fn ascii_ci_cmp(a: &str, b: &str) -> cmp::Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    for i in 0..a.len().min(b.len()) {
+        match a[i].to_ascii_lowercase().cmp(&b[i].to_ascii_lowercase()) {
+            cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    a.len().cmp(&b.len())
 }
