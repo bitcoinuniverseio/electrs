@@ -117,7 +117,7 @@ impl Store {
         &self,
         key: &[u8],
         maximum: usize,
-    ) -> Result<Option<Bytes>, super::qualification::QualifiedReadError> {
+    ) -> std::result::Result<Option<Bytes>, super::qualification::QualifiedReadError> {
         match self.txstore_db.qualified_get(key, maximum)? {
             Some(value) => Ok(Some(value)),
             None => {
@@ -271,7 +271,7 @@ fn baseline_point(
     key: &[u8],
     maximum: usize,
     window: &mut super::history_coverage::Window,
-) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+) -> std::result::Result<Vec<u8>, super::history_coverage::CoverageError> {
     use super::history_coverage::CoverageError;
     window.reserve(1, 1 + maximum / 32)?;
     // Reserve primary and explicit fallback before either dispatch.
@@ -290,7 +290,7 @@ fn baseline_history_point(
     key: &[u8],
     maximum: usize,
     window: &mut super::history_coverage::Window,
-) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+) -> std::result::Result<Vec<u8>, super::history_coverage::CoverageError> {
     window.reserve(1, 1 + maximum / 32)?;
     db.qualified_get(key, maximum)
         .map_err(|_| super::history_coverage::CoverageError::Storage)?
@@ -298,7 +298,9 @@ fn baseline_history_point(
 }
 
 #[cfg(not(feature = "liquid"))]
-fn increment_atomic(value: &str) -> Result<String, super::history_coverage::CoverageError> {
+fn increment_atomic(
+    value: &str,
+) -> std::result::Result<String, super::history_coverage::CoverageError> {
     let value = value
         .parse::<u64>()
         .map_err(|_| super::history_coverage::CoverageError::Contract)?;
@@ -308,7 +310,9 @@ fn increment_atomic(value: &str) -> Result<String, super::history_coverage::Cove
         .to_string())
 }
 #[cfg(not(feature = "liquid"))]
-fn decode_digest(value: &str) -> Result<Vec<u8>, super::history_coverage::CoverageError> {
+fn decode_digest(
+    value: &str,
+) -> std::result::Result<Vec<u8>, super::history_coverage::CoverageError> {
     if value.len() != 64 {
         return Err(super::history_coverage::CoverageError::Contract);
     }
@@ -469,8 +473,10 @@ impl Indexer {
     fn baseline_scope(
         &self,
         daemon: &Daemon,
-    ) -> Result<super::history_coverage::CoverageScope, super::history_coverage::CoverageError>
-    {
+    ) -> std::result::Result<
+        super::history_coverage::CoverageScope,
+        super::history_coverage::CoverageError,
+    > {
         use super::history_coverage::{digest, CoverageError, CoverageScope};
         let revision = option_env!("ELECTRS_SOURCE_REVISION").ok_or(CoverageError::Missing)?;
         let bootstrap = daemon
@@ -521,7 +527,7 @@ impl Indexer {
         height: u32,
         hash: &BlockHash,
         window: &mut super::history_coverage::Window,
-    ) -> Result<(), super::history_coverage::CoverageError> {
+    ) -> std::result::Result<(), super::history_coverage::CoverageError> {
         use super::history_coverage::{CoverageError, Progress};
         // Persist accounting, never an orphan prefix as a ready certificate.
         // Restart will revalidate from genesis and carry this cumulative count.
@@ -543,7 +549,7 @@ impl Indexer {
         &mut self,
         daemon: &Daemon,
         current_tip: &BlockHash,
-    ) -> Result<(), super::history_coverage::CoverageError> {
+    ) -> std::result::Result<(), super::history_coverage::CoverageError> {
         use super::history_coverage::{
             self as coverage, digest, BlockCertificate, CoverageError, Phase, Progress, Window,
         };
@@ -755,7 +761,7 @@ impl Indexer {
         }
         loop {
             let mut block_completed = false;
-            let result = (|| -> Result<(), CoverageError> {
+            let result = (|| -> std::result::Result<(), CoverageError> {
                 match runtime.progress.phase {
                     Phase::BlockRoster => {
                         window.reserve(1, 1)?;
@@ -1831,7 +1837,7 @@ impl PagedChainSnapshot<'_> {
         &self,
         key: &[u8],
         maximum: usize,
-    ) -> Result<Option<Bytes>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<Option<Bytes>, super::paged_outputs::PageError> {
         match self.txstore.point_value(key, maximum)? {
             Some(value) => Ok(Some(value)),
             None => {
@@ -1852,7 +1858,7 @@ impl PagedChainSnapshot<'_> {
             _ => 1,
         }
     }
-    pub fn valid(&self) -> Result<(), super::paged_outputs::PageError> {
+    pub fn valid(&self) -> std::result::Result<(), super::paged_outputs::PageError> {
         if self.chain.matches_read_generation(self.epoch) {
             Ok(())
         } else {
@@ -1862,7 +1868,10 @@ impl PagedChainSnapshot<'_> {
     pub fn history(
         &self,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::HistoryRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::HistoryRecord>,
+        super::paged_outputs::PageError,
+    > {
         use super::paged_outputs::{Funding, HistoryRecord, PageError};
         self.valid()?;
         let prefix = TxHistoryRow::filter(b'H', &self.script_hash);
@@ -1945,8 +1954,10 @@ impl PagedChainSnapshot<'_> {
         &self,
         txid: &Txid,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::ConfirmationRecord>, super::paged_outputs::PageError>
-    {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::ConfirmationRecord>,
+        super::paged_outputs::PageError,
+    > {
         use super::paged_outputs::{ConfirmationRecord, PageError};
         self.valid()?;
         let row = match self
@@ -1982,7 +1993,10 @@ impl PagedChainSnapshot<'_> {
         &self,
         point: &OutPoint,
         after: Option<&[u8]>,
-    ) -> Result<Option<super::paged_outputs::SpendRecord>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<
+        Option<super::paged_outputs::SpendRecord>,
+        super::paged_outputs::PageError,
+    > {
         use super::paged_outputs::{PageError, SpendRecord};
         use super::qualified_edges::EdgeKey;
         self.valid()?;
@@ -2066,7 +2080,7 @@ impl ChainQuery {
     #[cfg(not(feature = "liquid"))]
     pub fn paged_read_context(
         &self,
-    ) -> Result<(u64, BlockId, BlockHash), super::paged_outputs::PageError> {
+    ) -> std::result::Result<(u64, BlockId, BlockHash), super::paged_outputs::PageError> {
         use super::paged_outputs::PageError;
         let epoch = self
             .completed_read_generation()
@@ -2095,7 +2109,7 @@ impl ChainQuery {
         &self,
         script_hash: FullHash,
         epoch: u64,
-    ) -> Result<PagedChainSnapshot<'_>, super::paged_outputs::PageError> {
+    ) -> std::result::Result<PagedChainSnapshot<'_>, super::paged_outputs::PageError> {
         if !self.matches_read_generation(epoch) {
             return Err(super::paged_outputs::PageError::Unavailable);
         }
@@ -3035,7 +3049,7 @@ impl ChainQuery {
         budget: &super::qualified_edges::ReadBudget,
         key: &[u8],
         maximum: usize,
-    ) -> Result<Option<Bytes>, super::qualification::QualifiedReadError> {
+    ) -> std::result::Result<Option<Bytes>, super::qualification::QualifiedReadError> {
         let reads = if self.store.proof_txstore.is_some()
             && matches!(key.first(), Some(b'T') | Some(b'X') | Some(b'M'))
         {

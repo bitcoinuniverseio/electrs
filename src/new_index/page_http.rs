@@ -149,7 +149,7 @@ fn hmac(key: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut outer = sha256::Hash::engine();
     outer.input(&normalized.map(|v| v ^ 0x5c));
     outer.input(&digest[..]);
-    sha256::Hash::from_engine(outer).into_inner()
+    sha256::Hash::from_engine(outer).to_byte_array()
 }
 pub struct CursorCodec {
     key: [u8; 32],
