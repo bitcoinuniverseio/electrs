@@ -5,7 +5,7 @@ import json
 import pathlib
 import re
 
-LOCK_SHA = 'd70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676'
+LOCK_SHA = 'a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236'
 RUST_ROOT = '/home/github-runner/.rustup/toolchains/1.89.0-x86_64-unknown-linux-gnu'
 TOOL_PINS = {
     'rustc': (RUST_ROOT + '/bin/rustc', 'c6ac0142c05a60b0f6c15e1a118bd5ac3bd04924cd6dc0c328f501c5f86e4142'),
@@ -37,7 +37,7 @@ def validate(plan):
     if plan.get('profile') != 'unchanged-default' or plan.get('operation') not in ['test-compile', 'test']:
         raise ValueError('unreviewed operation/features')
     task = plan.get('taskRoot', '')
-    if not re.fullmatch(r'/opt/github-runners/runner-[0-9]{1,3}/_work/_temp/universe-electrs-build-[0-9]{1,20}-[0-9]{1,3}-[0-9a-f]{16}', task):
+    if not (re.fullmatch(r'/opt/github-runners/runner-[0-9]{1,3}/_work/_temp/universe-electrs-build-[0-9]{1,20}-[0-9]{1,3}-[0-9a-f]{16}', task) or re.fullmatch(r'/home/github-runner/.cache/universe-electrs-api-20261009/[0-9a-f]{16}', task)):
         raise ValueError('owned task root')
     paths = {key: owned_root(plan.get(key, ''), task) for key in ['workRoot', 'sourceRoot', 'vendorRoot']}
     if len(set(paths.values())) != 3 or any(pathlib.PurePosixPath(a) in pathlib.PurePosixPath(b).parents for a in paths.values() for b in paths.values() if a != b):

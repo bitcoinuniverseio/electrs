@@ -1,33 +1,36 @@
 """Pure Linux path/config renderer; no uploads/extraction/Cargo or mount actions."""
 import argparse
 import hashlib
-import importlib.util
 import json
 import pathlib
 import re
 
 HERE = pathlib.Path(__file__).resolve().parent
-VENDOR_MANIFEST_SHA = '1b86146fbb885080e835aa180ef60783a806f7a2926790281d7f47ec5a4a2c5f'
-LOCK_SHA = 'd70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676'
+VENDOR_MANIFEST_SHA = '08429b3f5b39688dcb927df81881d2c7843c2fe3942bfe170fbd08082528fd6f'
+LOCK_SHA = 'a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236'
+GIT_COMMIT = '4bbfc612d594fe23282c439d4bdc446cff01ba1c'
 
 
 def rendered(raw, task_root, source_manifest):
-    if hashlib.sha256(raw).hexdigest() != VENDOR_MANIFEST_SHA: raise ValueError('exact sealed204 vendor manifest required')
+    if hashlib.sha256(raw).hexdigest() != VENDOR_MANIFEST_SHA: raise ValueError('exact sealed233 vendor manifest required')
     manifest = json.loads(raw)
-    if manifest['schema'] != 'universe-electrs-sealed-linux-vendor-v1' or manifest['packageCount'] != 204 or len(manifest['files']) != 16390 or manifest['lockSha256'] != LOCK_SHA:
-        raise ValueError('full204/16390 lock binding required')
-    if not re.fullmatch(r'/opt/github-runners/runner-[0-9]{1,3}/_work/_temp/universe-electrs-build-[0-9]{1,20}-[0-9]{1,3}-[0-9a-f]{16}', task_root): raise ValueError('exact new owned Linux task root required')
+    if manifest['schema'] != 'universe-electrs-sealed-linux-vendor-v2' or manifest['packageCount'] != 233 or len(manifest['files']) != 18580 or manifest['lockSha256'] != LOCK_SHA:
+        raise ValueError('full233/18580 lock binding required')
+    temporary = re.fullmatch(r'/opt/github-runners/runner-[0-9]{1,3}/_work/_temp/universe-electrs-build-[0-9]{1,20}-[0-9]{1,3}-[0-9a-f]{16}', task_root)
+    persistent = re.fullmatch(r'/home/github-runner/.cache/universe-electrs-api-20261009/[0-9a-f]{16}', task_root)
+    if not (temporary or persistent): raise ValueError('exact new owned Linux task root required')
     if not re.fullmatch('[0-9a-f]{40}', source_manifest.get('sourceCommit', '')) or source_manifest.get('status') != 'DRAFT_SOURCE_ONLY_FULL_BUILD_UNQUALIFIED': raise ValueError('honest frozen full source manifest required')
     locks = [entry for entry in source_manifest['files'] if entry['path'] == 'Cargo.lock']
     if len(locks) != 1 or locks[0]['gitSha256'] != LOCK_SHA: raise ValueError('source/vendor lock contradiction')
-    spec = importlib.util.spec_from_file_location('materializer_config', HERE / 'materialize-locked-vendor.py')
-    materializer = importlib.util.module_from_spec(spec); spec.loader.exec_module(materializer)
     vendor = pathlib.PurePosixPath(task_root) / 'vendor'
-    config = materializer.cargo_config(vendor).encode()
-    return {'schema': 'universe-electrs-linux-offline-path-binding-v1', 'sourceSha': source_manifest['sourceCommit'],
+    config = ('[net]\noffline = true\n\n[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+              '[source."git+https://github.com/mempool/rust-electrum-client?rev=' + GIT_COMMIT + '"]\n'
+              'git = "https://github.com/mempool/rust-electrum-client"\nrev = "' + GIT_COMMIT + '"\nreplace-with = "vendored-sources"\n\n'
+              '[source.vendored-sources]\ndirectory = ' + json.dumps(str(vendor)) + '\n').encode()
+    return {'schema': 'universe-electrs-linux-offline-path-binding-v2', 'sourceSha': source_manifest['sourceCommit'],
             'vendorManifestSha256': VENDOR_MANIFEST_SHA, 'sourceManifestSha256': hashlib.sha256((json.dumps(source_manifest, sort_keys=True, separators=(',', ':')) + '\n').encode()).hexdigest(),
             'sourceManifestBindingEncoding': 'sorted-key compact JSON semantic binding; raw uploaded source manifest must also be independently pinned',
-            'cargoLockSha256': LOCK_SHA, 'sourceRoot': task_root + '/source', 'vendorRoot': str(vendor),
+            'cargoLockSha256': LOCK_SHA, 'sourceRoot': task_root + ('/source-' + source_manifest['sourceCommit'] if persistent else '/source'), 'vendorRoot': str(vendor),
             'workRoot': task_root + '/work', 'cargoHome': task_root + '/work/cargo-home',
             'targetRoot': task_root + '/work/target', 'temporaryRoot': task_root + '/work/tmp',
             'configSha256': hashlib.sha256(config).hexdigest(), 'configUtf8': config.decode(),

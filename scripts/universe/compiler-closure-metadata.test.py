@@ -12,6 +12,14 @@ module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 
 
 class Controls(unittest.TestCase):
+    def test_safe_leaf_phase_and_known_parser_code_without_raw_exception(self):
+        progress = {'phase': 'parse-compiler-elf', 'currentRole': 'compiler-library', 'currentLeaf': 'librustc_driver.so'}
+        result = module.failure_report(progress, ValueError('ELF string table bound'))
+        self.assertEqual(result['failureCode'], 'ELF_STRING_TABLE_BOUND')
+        self.assertEqual(result['currentLeaf'], 'librustc_driver.so')
+        self.assertNotIn('ELF string table bound', str(result))
+        unknown = module.failure_report(progress, ValueError('secret credential or arbitrary path'))
+        self.assertNotIn('secret', str(unknown)); self.assertEqual(unknown['failureCode'], 'METADATA_GUARD_REJECTED')
     def test_directory_entries_are_bounded_without_files(self):
         budget = module.Budget()
         with self.assertRaises(ValueError): budget.tick(100001)

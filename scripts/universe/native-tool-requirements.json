@@ -1,19 +1,23 @@
 {
-  "schema": "universe-electrs-native-tool-requirements-v1",
-  "status": "REVIEWED_SOURCE_REQUIREMENTS_ONLY_NOT_BUILD_QUALIFICATION",
-  "cargoLockSha256": "d70b0284f71409a27beb6e9f50b3e137c36463fc82aa987c225c8f4ced32a676",
-  "cargoTomlSha256": "850b52199483aa2162da93d23918fc97b3be9a64111175a239c829e6af2c0a08",
-  "sourceQualificationReceiptSha256": "632b0cbe389a2748cb7a653f178c3bb2bd0e0d62eebdb15f3e6e6a68f3d199e8",
-  "sourceQualificationTrust": "Locally reviewed primary published source captures, not verified crate archive checksum or native build proof",
-  "selectedProfile": "unchanged application default/liquid/electrum-discovery; no dependency-feature overrides",
-  "cmakeRequired": false,
-  "cmakeDecision": "libz-sys1.1.9 optional zlib-ng only; librocksdb-sys disables defaults and enables static; no zlib-ng activation or cmake lock package",
-  "requiresRequalification": ["changed Cargo.lock", "changed Cargo.toml/features", "zlib-ng", "cmake lock entry"],
-  "primarySources": [
-    "https://docs.rs/crate/libz-sys/1.1.9/source/Cargo.toml",
-    "https://docs.rs/crate/libz-sys/1.1.9/source/build.rs",
-    "https://docs.rs/crate/librocksdb-sys/0.17.3%2B10.4.2/source/Cargo.toml",
-    "https://docs.rs/crate/librocksdb-sys/0.17.3%2B10.4.2/source/build.rs",
-    "https://docs.rs/crate/rocksdb/0.24.0/source/Cargo.toml"
-  ]
+  "schema": "universe-electrs-native-tool-requirements-v2",
+  "status": "FINAL233_SOURCE_REVIEW_ONLY_PROFILE_UNQUALIFIED",
+  "cargoLockSha256": "a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236",
+  "cargoTomlSha256": "8e882e8c161ce89cab81ff30d278e5caf1c4f01e4cbf4a5ef47d7c7e2159dff2",
+  "sourceQualificationReceiptSha256": "e8b34231976cb87bb4a74c0ed03a0a4fbc6492c4df5fff6faaf58405743764c3",
+  "sourceQualificationTrust": "Exact locked archive checksums and selected source review; not native build or target feature qualification",
+  "selectedProfile": "unchanged application default/liquid/electrum-discovery; no feature or builder-forcing overrides",
+  "profileEligibility": "UNQUALIFIED_FINAL233_SELECTION",
+  "cmakeRequired": true,
+  "cmakeDecision": "Conservative required until final target/features resolve aws-lc-sys CC vs CMake branch. cmake0.1.54 is locked; no old204 optional-tool waiver applies. This does not claim CC path invokes CMake.",
+  "requiresRequalification": [
+    "Actual target/default feature graph",
+    "AWS-LC pregenerated bindings/C/assembly presence",
+    "CC/ar/assembler/startup and libclang/resource closure",
+    "CMake actual CLI/runtime if fallback selected"
+  ],
+  "historicalCapsuleCommit": "0328124ccd41ef69d32c8e202b838777c58b9014",
+  "historicalCapsuleSha256": "1a86886fb3a9b687004015877904164f4dd5aefdcd81f2ed8b5c7efba52a65e1",
+  "cargoInvoked": false,
+  "featuresChanged": false,
+  "buildQualified": false
 }

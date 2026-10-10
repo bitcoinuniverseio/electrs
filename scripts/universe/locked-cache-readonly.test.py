@@ -78,7 +78,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(result['gitSource'][0]['state'], 'locked-git-checkout-missing')
 
     def test_runtime_wrong_owner_branch_and_python_effects(self):
-        environment = {'GITHUB_REPOSITORY': 'bitcoinuniverseio/electrs', 'GITHUB_REF': 'refs/heads/codex/bounded-script-utxo-pages', 'GITHUB_SHA': 'a' * 40}
+        environment = {'GITHUB_REPOSITORY': 'bitcoinuniverseio/electrs', 'GITHUB_REF': 'refs/heads/develop', 'GITHUB_SHA': 'a' * 40}
         with patch.object(wrapper.platform, 'system', return_value='Linux'), patch.object(wrapper.os, 'getuid', create=True, return_value=1001), patch.dict(wrapper.os.environ, environment):
             with patch.dict(wrapper.os.environ, {'GITHUB_REF': 'refs/heads/mempool'}):
                 with self.assertRaisesRegex(ValueError, 'branch'): wrapper.runtime_guard()

@@ -12,6 +12,7 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 IMAGE_BYTES = 8 * 1024**3
+FINAL_LOCK_SHA = 'a46b82fd06e8fe3858a1722ec0098d528bd2f4920bc3116c7e247ef473613236'
 RESOURCES = {'cpu.max': '200000 100000', 'memory.max': str(4 * 1024**3), 'pids.max': '128'}
 VERIFIED_FENCES = {}
 
@@ -122,7 +123,7 @@ def context_check(context, root, verify_bytes=True):
     if context.get('taskRoot', str(root)) != str(root): raise ValueError('task root binding')
     if not re.fullmatch(r'universe-electrs-build-[0-9]{1,20}-[0-9]{1,3}-[0-9a-f]{16}', context.get('executionUnit', root.name)):
         raise ValueError('unique execution unit namespace')
-    if not re.fullmatch('[0-9a-f]{40}', context.get('sourceSha', '')) or not re.fullmatch('[0-9a-f]{64}', context.get('cargoLockSha256', '')):
+    if not re.fullmatch('[0-9a-f]{40}', context.get('sourceSha', '')) or context.get('cargoLockSha256') != FINAL_LOCK_SHA:
         raise ValueError('full source and final lock binding required')
     if context.get('operation') not in ['test-compile', 'test'] or context.get('profile') != 'unchanged-default': raise ValueError('unreviewed Cargo operation')
     paths = {key: under(context[key], root) for key in ['sourceRoot', 'vendorRoot', 'wrapperBinary', 'readRootsFile', 'packageRoot']}
@@ -227,7 +228,7 @@ def verify_tree(root, manifest, kind, context):
             raise ValueError('frozen source manifest identity')
         digest_key = 'gitSha256'; prefix = ''
     else:
-        if manifest.get('schema') != 'universe-electrs-sealed-linux-vendor-v1' or manifest.get('lockSha256') != context['cargoLockSha256']:
+        if manifest.get('schema') != 'universe-electrs-sealed-linux-vendor-v2' or manifest.get('packageCount') != 233 or len(manifest.get('files', [])) != 18580 or manifest.get('lockSha256') != context['cargoLockSha256']:
             raise ValueError('sealed final-lock vendor manifest identity')
         digest_key = 'sha256'; prefix = 'vendor/'
     entries = manifest.get('files', [])
