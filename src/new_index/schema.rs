@@ -347,6 +347,7 @@ fn ledger_cache_key(kind: u8, script: &[u8]) -> Vec<u8> {
 
 struct IndexerConfig {
     light_mode: bool,
+    retain_history_bodies: bool,
     address_search: bool,
     index_unspendables: bool,
     network: Network,
@@ -354,10 +355,70 @@ struct IndexerConfig {
     parent_network: crate::chain::BNetwork,
 }
 
+#[cfg(all(test, not(feature = "liquid")))]
+mod retained_light_history_tests {
+    use super::*;
+    use crate::util::HeaderList;
+    use bitcoin::hashes::Hash;
+
+    #[test]
+    fn retained_light_blocks_have_exact_full_t_x_m_rows_without_changing_other_rows() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet);
+        let size = serialize(&block).len() as u32;
+        let entry = HeaderList::empty().order(vec![block.header]).remove(0);
+        let blocks = [BlockEntry { block, entry, size }];
+        let mut config = IndexerConfig {
+            light_mode: false,
+            retain_history_bodies: false,
+            address_search: false,
+            index_unspendables: false,
+            network: Network::Signet,
+        };
+        let full = add_blocks(&blocks, &config);
+        config.light_mode = true;
+        let legacy = add_blocks(&blocks, &config);
+        assert!(legacy
+            .iter()
+            .all(|row| !matches!(row.key[0], b'T' | b'X' | b'M')));
+        config.retain_history_bodies = true;
+        let retained = add_blocks(&blocks, &config);
+        assert_eq!(retained, full);
+        assert_eq!(
+            legacy,
+            retained
+                .iter()
+                .filter(|row| !matches!(row.key[0], b'T' | b'X' | b'M'))
+                .map(|row| DBRow {
+                    key: row.key.clone(),
+                    value: row.value.clone()
+                })
+                .collect::<Vec<_>>()
+        );
+        let roster = retained.iter().find(|row| row.key[0] == b'X').unwrap();
+        assert_eq!(roster.value.len(), 40);
+        assert_eq!(&roster.value[..8], &1u64.to_le_bytes());
+        assert_eq!(
+            &roster.value[8..],
+            &blocks[0].block.txdata[0].compute_txid().to_byte_array()
+        );
+        let meta = retained.iter().find(|row| row.key[0] == b'M').unwrap();
+        assert_eq!(
+            meta.value,
+            [
+                1u32.to_le_bytes(),
+                size.to_le_bytes(),
+                (blocks[0].block.weight().to_wu() as u32).to_le_bytes()
+            ]
+            .concat()
+        );
+    }
+}
+
 impl From<&Config> for IndexerConfig {
     fn from(config: &Config) -> Self {
         IndexerConfig {
             light_mode: config.light_mode,
+            retain_history_bodies: config.retain_history_bodies,
             address_search: config.address_search,
             index_unspendables: config.index_unspendables,
             network: config.network_type,
@@ -418,6 +479,7 @@ impl Indexer {
                 db_path: config.db_path.to_string_lossy().into_owned(),
                 rpc_address: config.daemon_rpc_addr.to_string(),
                 light_mode: config.light_mode,
+                retain_history_bodies: config.retain_history_bodies,
                 index_unspendables: config.index_unspendables,
                 db_version: super::db::DB_VERSION,
                 electrs_version: crate::config::ELECTRS_VERSION.into(),
@@ -3604,7 +3666,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
                 add_transaction(tx, blockhash, &mut rows, iconfig);
             }
 
-            if !iconfig.light_mode {
+            if !iconfig.light_mode || iconfig.retain_history_bodies {
                 rows.push(BlockRow::new_txids(blockhash, &txids).into_row());
                 rows.push(BlockRow::new_meta(blockhash, &BlockMeta::from(b)).into_row());
             }
@@ -3625,7 +3687,7 @@ fn add_transaction(
 ) {
     rows.push(TxConfRow::new(tx, blockhash).into_row());
 
-    if !iconfig.light_mode {
+    if !iconfig.light_mode || iconfig.retain_history_bodies {
         rows.push(TxRow::new(tx).into_row());
     }
 
@@ -4624,6 +4686,7 @@ mod supplemental_edge_writer_tests {
         };
         let config = IndexerConfig {
             light_mode: false,
+            retain_history_bodies: false,
             address_search: false,
             index_unspendables: false,
             network: Network::Regtest,

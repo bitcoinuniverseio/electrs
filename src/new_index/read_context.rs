@@ -115,6 +115,7 @@ pub struct StaticReadProfile {
     pub db_path: String,
     pub rpc_address: String,
     pub light_mode: bool,
+    pub retain_history_bodies: bool,
     pub index_unspendables: bool,
     pub db_version: u32,
     pub electrs_version: String,
@@ -139,10 +140,15 @@ impl StaticReadProfile {
             self.work_limit,
             self.body_limit,
         ))?;
-        if let Some(directory) = &self.history_proof_dir {
+        if self.history_proof_dir.is_some() || self.retain_history_bodies {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
             if let Some(fields) = value.as_array_mut() {
-                fields.push(serde_json::json!({"historyProofDirectory":directory}));
+                if let Some(directory) = &self.history_proof_dir {
+                    fields.push(serde_json::json!({"historyProofDirectory":directory}));
+                }
+                if self.retain_history_bodies {
+                    fields.push(serde_json::json!({"retainHistoryBodies":true}));
+                }
             }
             serde_json::to_vec(&value)
         } else {
@@ -166,6 +172,7 @@ mod tests {
             db_path: "owned-db".into(),
             rpc_address: "127.0.0.1:1".into(),
             light_mode: false,
+            retain_history_bodies: false,
             index_unspendables: false,
             db_version: 2,
             electrs_version: "test".into(),
@@ -190,6 +197,9 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(profile.bytes(&bootstrap).unwrap(), old);
+        profile.retain_history_bodies = true;
+        assert_ne!(profile.bytes(&bootstrap).unwrap(), old);
+        profile.retain_history_bodies = false;
         profile.history_proof_dir = Some("explicit-local-proof".into());
         assert_ne!(profile.bytes(&bootstrap).unwrap(), old);
     }
