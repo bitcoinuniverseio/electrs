@@ -30,7 +30,7 @@ cargo check $@ -q --all-features
 
 TESTNAME="Running cargo fmt check"
 echo "$TESTNAME"
-cargo fmt $@ -q --all -- --check
+cargo fmt -q --all -- --check
 
 # Testing all the combinations of clippy.
 # There were many instances where a certain struct

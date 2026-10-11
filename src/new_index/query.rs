@@ -264,6 +264,7 @@ impl Query {
             db_path: self.config.db_path.to_string_lossy().into_owned(),
             rpc_address: self.config.daemon_rpc_addr.to_string(),
             light_mode: self.config.light_mode,
+            retain_history_bodies: self.config.retain_history_bodies,
             index_unspendables: self.config.index_unspendables,
             db_version: super::db::DB_VERSION,
             electrs_version: crate::config::ELECTRS_VERSION.into(),
