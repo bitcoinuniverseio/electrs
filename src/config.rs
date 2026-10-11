@@ -49,6 +49,7 @@ pub struct Config {
     pub monitoring_addr: SocketAddr,
     pub jsonrpc_import: bool,
     pub light_mode: bool,
+    pub retain_history_bodies: bool,
     pub main_loop_delay: u64,
     pub address_search: bool,
     pub index_unspendables: bool,
@@ -189,6 +190,9 @@ impl Config {
                     .long("lightmode")
                     .help("Enable light mode for reduced storage")
             )
+            .arg(Arg::with_name("retain_history_bodies").long("retain-history-bodies")
+                .requires("light_mode")
+                .help("Retain exact T/X/M evidence for future already-fetched blocks under the existing light-mode writer; does not restore past history"))
             .arg(
                 Arg::with_name("main_loop_delay")
                     .long("main-loop-delay")
@@ -601,6 +605,7 @@ impl Config {
             ),
             jsonrpc_import: m.is_present("jsonrpc_import"),
             light_mode: m.is_present("light_mode"),
+            retain_history_bodies: m.is_present("retain_history_bodies"),
             main_loop_delay: value_t_or_exit!(m, "main_loop_delay", u64),
             address_search: m.is_present("address_search"),
             index_unspendables: m.is_present("index_unspendables"),

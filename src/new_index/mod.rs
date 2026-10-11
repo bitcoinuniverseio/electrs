@@ -8,6 +8,8 @@ pub mod page_http;
 #[cfg(not(feature = "liquid"))]
 pub mod paged_outputs;
 pub mod precache;
+#[cfg(not(feature = "liquid"))]
+pub mod proof_rows;
 pub mod qualification;
 pub mod qualified_edges;
 mod query;
