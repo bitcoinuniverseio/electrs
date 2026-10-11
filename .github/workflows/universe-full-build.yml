@@ -242,7 +242,7 @@ jobs:
             BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_EXTRA_CLANG_ARGS" \
             CARGO_HOME="$CARGO_HOME" CARGO_TARGET_DIR="$TASK/target" TMPDIR="$CARGO_HOME/tmp" \
             GIT_HASH="$EXPECTED_SHA" ELECTRS_SOURCE_REVISION="$EXPECTED_SHA" \
-            "$CARGO" build --release --bin electrs --offline --frozen --jobs 2 --manifest-path "$SOURCE/Cargo.toml"
+            /bin/bash "$SOURCE/scripts/universe/check-local-proof-release.sh" "$SOURCE"
           sha256sum "$TASK/target/release/electrs"
           stat -c 'binary bytes=%s' "$TASK/target/release/electrs"
           du -sb "$TASK/target"
@@ -258,6 +258,10 @@ jobs:
           def digest(path):
               with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
           if digest(binary)!=digest(output):raise SystemExit('binary artifact copy changed')
+          helper=task/'target/release/history-proof-ingest';helper_output=artifact/'history-proof-ingest'
+          if helper.is_symlink() or not helper.is_file() or not 1<=helper.stat().st_size<=268435456:raise SystemExit('bounded successful helper binary required')
+          shutil.copyfile(helper,helper_output);helper_output.chmod(0o555)
+          if digest(helper)!=digest(helper_output):raise SystemExit('helper artifact copy changed')
           def metadata(command):
               result=subprocess.run(command,env={'PATH':'/usr/bin:/bin','LANG':'C'},stdin=subprocess.DEVNULL,capture_output=True,timeout=3,check=False)
               return {'exitCode':result.returncode,'stdout':result.stdout[:16384].decode('utf-8',errors='replace'),
@@ -281,7 +285,9 @@ jobs:
                    'sourceSha':sha,'package':app['package']['name'],'packageVersion':app['package']['version'],
                    'cargoLockSha256':lock_sha,'vendorArchiveSha256':vendor_sha,'vendorManifestSha256':manifest_sha,
                    'applicationFeatureSelection':'default; no --features or --no-default-features overrides','declaredDefaultFeatures':app['features']['default'],
-                   'command':['cargo','build','--release','--bin','electrs','--offline','--frozen','--jobs','2'],
+                   'command':['bash','scripts/universe/check-local-proof-release.sh'],
+                   'requiredChecks':'checks.sh --release INCLUDE_TESTS=1; default Bitcoin library tests; both release binaries built with shared cache',
+                   'helperBinary':{'file':'history-proof-ingest','sha256':digest(helper_output),'bytes':helper_output.stat().st_size},
                    'compileExitCode':0,'binary':{'file':'electrs','sha256':digest(output),'bytes':output.stat().st_size},
                    'tools':tools,'ldd':linkage,'runtimeDependenciesResolved':linkage['exitCode']==0 and not linkage['truncated'] and 'not found' not in linkage['stdout'],
                    'targetCacheRetained':True,'recompiledForArtifactCollection':False,'nativeStarted':False,'liveDbOpened':False,'nativeAcceptanceClaim':False,'goClaim':False}
