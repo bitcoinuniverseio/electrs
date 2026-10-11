@@ -81,10 +81,15 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<ProofChunk, String> {
                 }
                 let transactions = u64::from_le_bytes(value[..8].try_into().map_err(|_| bad())?);
                 if transactions == 0
-                    || transactions > (ROW_BYTES / 32) as u64
-                    || 8 + transactions as usize * 32 != size
+                    || transactions > (ROW_BYTES / 40) as u64
+                    || 8 + transactions as usize * 40 != size
                 {
                     return Err(bad());
+                }
+                for encoded in value[8..].chunks_exact(40) {
+                    if encoded[..8] != 32u64.to_le_bytes() {
+                        return Err(bad());
+                    }
                 }
                 work = work
                     .checked_add(1 + transactions as usize)
@@ -160,6 +165,20 @@ mod tests {
             key[0] = kind;
             assert!(decode_chunk(&chunk(&[(key.clone(), serialize(tx))])).is_err());
         }
+    }
+    #[test]
+    fn roster_requires_each_bincode_hash_length() {
+        let mut key = vec![b'X'];
+        key.extend([9u8; 32]);
+        let mut value = 1u64.to_le_bytes().to_vec();
+        value.extend(32u64.to_le_bytes());
+        value.extend([3u8; 32]);
+        assert!(decode_chunk(&chunk(&[(key.clone(), value.clone())])).is_ok());
+        value[8] = 31;
+        assert!(decode_chunk(&chunk(&[(key.clone(), value)])).is_err());
+        let mut old_encoding = 1u64.to_le_bytes().to_vec();
+        old_encoding.extend([3u8; 32]);
+        assert!(decode_chunk(&chunk(&[(key, old_encoding)])).is_err());
     }
     #[test]
     fn digest_identity_lengths_eof_and_consensus_corruption_fail_closed() {
