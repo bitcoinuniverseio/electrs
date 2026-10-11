@@ -52,7 +52,7 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(proof.double_hash(GENESIS_RAW[:80]), expected)
         rows = proof.block_rows(GENESIS_RAW, expected, proof.Window())
         self.assertEqual([key[:1] for key, _ in rows], [b'T', b'X', b'M'])
-        self.assertEqual(rows[1][1], struct.pack('<Q', 1) + rows[0][0][1:])
+        self.assertEqual(rows[1][1], struct.pack('<QQ', 1, 32) + rows[0][0][1:])
         self.assertEqual(rows[2][1], struct.pack('<III', 1, len(GENESIS_RAW), len(GENESIS_RAW) * 4))
         self.assertEqual(rows[0][0][1:], proof.double_hash(rows[0][1]))
 
