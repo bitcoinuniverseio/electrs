@@ -181,7 +181,7 @@ def block_rows(body, expected_hash, budget):
         if double_hash(root + witness[0][0]) != commitments[-1]:
             raise InvalidProof('Witness commitment failed')
     rows = [(b'T' + tx['txid'], tx['raw']) for tx in transactions]
-    rows.append((b'X' + block_hash, struct.pack('<Q', count) + b''.join(txids)))
+    rows.append((b'X' + block_hash, struct.pack('<Q', count) + b''.join(struct.pack('<Q', 32) + txid for txid in txids)))
     rows.append((b'M' + block_hash, struct.pack('<III', count, len(body), weight)))
     return rows
 
