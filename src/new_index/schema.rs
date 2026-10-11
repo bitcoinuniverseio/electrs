@@ -395,10 +395,11 @@ mod retained_light_history_tests {
                 .collect::<Vec<_>>()
         );
         let roster = retained.iter().find(|row| row.key[0] == b'X').unwrap();
-        assert_eq!(roster.value.len(), 40);
+        assert_eq!(roster.value.len(), 48);
         assert_eq!(&roster.value[..8], &1u64.to_le_bytes());
+        assert_eq!(&roster.value[8..16], &32u64.to_le_bytes());
         assert_eq!(
-            &roster.value[8..],
+            &roster.value[16..],
             &blocks[0].block.txdata[0].compute_txid().to_byte_array()
         );
         let meta = retained.iter().find(|row| row.key[0] == b'M').unwrap();
