@@ -30,7 +30,7 @@ runs:
         if [ -z "${RUST_TOOLCHAIN}" ]; then
           RUST_TOOLCHAIN="$(cat rust-toolchain)"
         fi
-        echo "toolchain=\"${RUST_TOOLCHAIN}\"" >> $GITHUB_OUTPUT
+        echo "toolchain=${RUST_TOOLCHAIN}" >> "$GITHUB_OUTPUT"
     - name: Install ${{ steps.gettoolchain.outputs.toolchain }} Rust toolchain
       id: toolchain
       # Commit date is Nov 18, 2024
