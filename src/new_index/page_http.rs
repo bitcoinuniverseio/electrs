@@ -14,6 +14,12 @@ pub struct ReaderBudget {
 pub struct ReaderLease<'a> {
     owner: &'a ReaderBudget,
 }
+impl Default for ReaderBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReaderBudget {
     pub fn new() -> Self {
         Self {
@@ -107,7 +113,7 @@ pub fn parse_request(raw: Option<&str>, body_length: usize) -> Result<PageReques
         return Err(PageError::Contract);
     }
     let cursor = fields.get("cursor").map(|s| (*s).to_owned());
-    if cursor.as_ref().map_or(false, |s| s.len() > CURSOR_LIMIT) {
+    if cursor.as_ref().is_some_and(|s| s.len() > CURSOR_LIMIT) {
         return Err(PageError::Capacity);
     }
     Ok(PageRequest {

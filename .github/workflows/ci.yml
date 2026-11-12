@@ -3,15 +3,15 @@ on:
   push:
     branches:
       - mempool
+      - develop
 
 
 name: Compile Check and Lint
 
 jobs:
   check:
-    if: github.repository == 'mempool/electrs'
     name: Compile Check
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Rust
@@ -21,9 +21,8 @@ jobs:
       - run: cargo check --all-features
 
   fmt:
-    if: github.repository == 'mempool/electrs'
     name: Formatter
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Rust
@@ -33,9 +32,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   test:
-    if: github.repository == 'mempool/electrs'
     name: Run Tests
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Rust
@@ -45,14 +43,34 @@ jobs:
       - run: cargo test --lib --all-features
 
   compile-freebsd:
-    if: github.repository == 'mempool/electrs'
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     name: Run Compile Checks in FreeBSD
     env:
       FREEBSD_VER: "14.3"
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Probe whether this self-hosted runner can launch a FreeBSD VM
+      id: probe
+      shell: bash
+      run: |
+        set +e
+        reason=""
+        if ! sudo -n true >/dev/null 2>sudo.err; then
+          reason="$(tr '\n' ' ' < sudo.err | sed 's/[[:space:]]\+/ /g')"
+          [ -n "$reason" ] || reason="sudo -n true failed"
+        fi
+        rm -f sudo.err
+        if [ -n "$reason" ]; then
+          echo "capable=false" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "::notice::Skipping FreeBSD VM: this self-hosted runner cannot use sudo ($reason). The remaining required CI jobs still run on [self-hosted, Linux, X64, universe]."
+          echo "SKIPPED: $reason" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "capable=true" >> "$GITHUB_OUTPUT"
+          echo "This runner can use sudo; continuing with the FreeBSD VM." >> "$GITHUB_STEP_SUMMARY"
+        fi
     - name: Cache dependencies for FreeBSD
+      if: steps.probe.outputs.capable == 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -61,6 +79,7 @@ jobs:
           target
         key: freebsd-${{ env.FREEBSD_VER }}-cargo-checks-${{ hashFiles('**/Cargo.lock') }}
     - name: Compile Checks in FreeBSD
+      if: steps.probe.outputs.capable == 'true'
       uses: vmactions/freebsd-vm@d0518f912576ae759075aa00fb9fe27037940271 # v1.5.4
       with:
         usesh: true
@@ -89,9 +108,8 @@ jobs:
           mv ~/.cargo/git ./.cargohome/
 
   clippy:
-    if: github.repository == 'mempool/electrs'
     name: Linter
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     needs: [check]
     strategy:
       matrix: # Try all combinations of features. Some times weird things appear.

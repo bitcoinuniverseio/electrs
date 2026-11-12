@@ -13,6 +13,11 @@ struct State {
 pub struct ReadGeneration {
     state: Mutex<State>,
 }
+impl Default for ReadGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub struct Mutation<'a> {
     owner: &'a ReadGeneration,
     odd: Option<u64>,

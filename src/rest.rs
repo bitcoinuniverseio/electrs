@@ -694,7 +694,7 @@ async fn run_server(
                                 req.headers().get_all(hyper::header::CONTENT_LENGTH).iter();
                             let first = lengths.next();
                             let body_allowed = lengths.next().is_none()
-                                && first.map_or(true, |v| v.as_bytes() == b"0")
+                                && first.is_none_or(|v| v.as_bytes() == b"0")
                                 && !req.headers().contains_key(hyper::header::TRANSFER_ENCODING)
                                 && req.body().is_end_stream();
                             close_rejected_body =

@@ -252,7 +252,7 @@ impl PageCursor {
             return Err(PageError::Contract);
         }
         let key_valid =
-            |key: Option<&[u8]>| key.map_or(true, |k| !k.is_empty() && k.len() <= KEY_LIMIT);
+            |key: Option<&[u8]>| key.is_none_or(|k| !k.is_empty() && k.len() <= KEY_LIMIT);
         if !key_valid(self.last_history_key.as_deref()) {
             return Err(PageError::Contract);
         }
@@ -269,7 +269,7 @@ impl PageCursor {
                 || (p.spend_txid.is_some() && p.spend_key.is_none())
                 || (p.spend_txid.is_some() != p.spend_block.is_some())
                 || (p.spend_txid.is_some() != p.spend_position.is_some())
-                || p.spend_block.as_ref().map_or(false, |block| {
+                || p.spend_block.as_ref().is_some_and(|block| {
                     block.height as u64 > self.scope.height as u64
                         || !(block.height > p.funding.height as usize
                             || (block.height == p.funding.height as usize
@@ -277,12 +277,12 @@ impl PageCursor {
                 })
                 || p.block_hash
                     .as_ref()
-                    .map_or(false, |hash| !lower_hex(hash, 64) || !p.confirmation_seen)
+                    .is_some_and(|hash| !lower_hex(hash, 64) || !p.confirmation_seen)
                 || (p.funding_confirmation_complete && p.block_hash.is_none())
                 || (!p.funding_confirmation_complete && p.block_hash.is_some())
-                || p.latest_incarnation.as_ref().map_or(false, |block| {
-                    block.height as u64 > self.scope.height as u64
-                })
+                || p.latest_incarnation
+                    .as_ref()
+                    .is_some_and(|block| block.height as u64 > self.scope.height as u64)
                 || (p.emitted && (p.block_hash.is_none() || p.spend_txid.is_some()))
             {
                 return Err(PageError::Contract);
@@ -416,7 +416,7 @@ pub(crate) fn read_page_until(
                             // Only this edge's actual containing block may
                             // prove a spend. Another txid incarnation is not
                             // interchangeable, even when it is canonical.
-                            if p.spend_block.as_ref().map_or(false, |expected| {
+                            if p.spend_block.as_ref().is_some_and(|expected| {
                                 expected.hash == block.hash && expected.height == block.height
                             }) {
                                 state.last_history_key = Some(p.funding_key);
@@ -659,7 +659,7 @@ mod tests {
             }
             if self
                 .changed_after
-                .map_or(false, |limit| self.visits.get() >= limit)
+                .is_some_and(|limit| self.visits.get() >= limit)
             {
                 return Err(PageError::Changed);
             }
@@ -829,7 +829,7 @@ mod tests {
             if scope != &super::tests::scope() {
                 return Err(PageError::Contract);
             }
-            if self.changed.map_or(false, |n| self.visits.get() >= n) {
+            if self.changed.is_some_and(|n| self.visits.get() >= n) {
                 return Err(PageError::Changed);
             }
             Ok(())

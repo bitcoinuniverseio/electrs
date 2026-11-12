@@ -12,6 +12,11 @@ const DOMAIN: [u8; 4] = [0xff, b'U', b'E', 1];
 /// One logical request budget, shared by all nested point reads and output
 /// workers. Reserving never resets on a nested call or after partial success.
 pub struct ReadBudget(std::sync::atomic::AtomicUsize);
+impl Default for ReadBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl ReadBudget {
     pub fn new() -> Self {
         Self(std::sync::atomic::AtomicUsize::new(0))

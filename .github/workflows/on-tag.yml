@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     if: github.repository == 'mempool/electrs'
-    runs-on: mempool-ci
+    runs-on: [self-hosted, Linux, X64, universe]
     timeout-minutes: 120
     name: Build and push to DockerHub
     strategy:

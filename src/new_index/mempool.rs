@@ -470,9 +470,8 @@ impl Mempool {
         // [LOCK] No lock taken. Wait for RPC request. Get lists of remove/add txes.
         let all_txids = daemon
             .getmempooltxids()
-            .map_err(|error| {
+            .inspect_err(|_| {
                 mempool.write().unwrap().invalidate_read_publication();
-                error
             })
             .chain_err(|| "failed to update mempool from daemon")?;
         let txids_to_remove: HashSet<&Txid> = old_txids.difference(&all_txids).collect();
@@ -492,9 +491,8 @@ impl Mempool {
         // [LOCK] No lock taken, waiting for RPC response.
         let txs_to_add = daemon
             .gettransactions(&txids_to_add)
-            .map_err(|error| {
+            .inspect_err(|_| {
                 mempool.write().unwrap().invalidate_read_publication();
-                error
             })
             .chain_err(|| format!("failed to get {} transactions", txids_to_add.len()))?;
 

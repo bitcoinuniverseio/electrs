@@ -63,7 +63,7 @@ impl CoverageScope {
                 && !self
                     .signet_challenge_sha256
                     .as_ref()
-                    .map_or(false, |value| lower_hex(value, 64)))
+                    .is_some_and(|value| lower_hex(value, 64)))
             || (self.network != "signet" && self.signet_challenge_sha256.is_some())
         {
             return Err(CoverageError::Contract);
@@ -167,13 +167,13 @@ impl Progress {
         if self
             .parent_after_key
             .as_ref()
-            .map_or(false, |key| key.is_empty() || key.len() > 256)
+            .is_some_and(|key| key.is_empty() || key.len() > 256)
             || self.parent_best_height.is_some() != self.parent_best_hash.is_some()
             || self.parent_best_height.is_some() != self.parent_best_position.is_some()
             || self
                 .parent_best_hash
                 .as_ref()
-                .map_or(false, |hash| !lower_hex(hash, 64))
+                .is_some_and(|hash| !lower_hex(hash, 64))
         {
             return Err(CoverageError::Contract);
         }
@@ -229,6 +229,12 @@ pub struct Window {
     work: usize,
     persisted_visits: usize,
 }
+impl Default for Window {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Window {
     pub fn new() -> Self {
         Self {
@@ -264,6 +270,12 @@ impl Window {
 pub struct RosterProof {
     seen: std::collections::BTreeSet<[u8; 32]>,
 }
+impl Default for RosterProof {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RosterProof {
     pub fn new() -> Self {
         Self {
