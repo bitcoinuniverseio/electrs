@@ -217,6 +217,7 @@ pub enum DBFlush {
 }
 
 impl DB {
+    #[cfg(not(feature = "liquid"))]
     pub(crate) fn open_proof_read_only(path: &Path) -> crate::errors::Result<Self> {
         use crate::errors::ResultExt;
         let options = rocksdb::Options::default();
@@ -350,7 +351,7 @@ impl DB {
         use crate::errors::ResultExt;
         if prefix.is_empty()
             || prefix.len() > 256
-            || after.map_or(false, |key| key.len() > 256 || !key.starts_with(prefix))
+            || after.is_some_and(|key| key.len() > 256 || !key.starts_with(prefix))
         {
             return Err("invalid exact scan cursor".into());
         }
@@ -381,6 +382,7 @@ impl DB {
     }
     /// Supplemental proof/progress writes use the existing DB owner, with a
     /// single sync/WAL-enabled atomic batch. Errors never advance progress.
+    #[cfg(not(feature = "liquid"))]
     pub(crate) fn write_coverage(&self, rows: Vec<DBRow>) -> crate::errors::Result<()> {
         use crate::errors::ResultExt;
         let mut batch = rocksdb::WriteBatch::default();

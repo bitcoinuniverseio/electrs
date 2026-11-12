@@ -98,7 +98,7 @@ impl BootstrapObservation {
                     && self
                         .signet_challenge_sha256
                         .as_ref()
-                        .map_or(false, |h| h.len() == 64 && lower_hex(h))
+                        .is_some_and(|h| h.len() == 64 && lower_hex(h))
             } else {
                 self.signet_challenge_sha256.is_none()
                     && self.signet_challenge_commitment_encoding.is_none()

@@ -514,7 +514,7 @@ impl Indexer {
                 .store
                 .coverage_scope
                 .try_read()
-                .map_or(false, |scope| scope.is_some())
+                .is_ok_and(|scope| scope.is_some())
             && self.baseline.is_none()
         {
             return;
@@ -1111,9 +1111,7 @@ impl Indexer {
                                         && runtime
                                             .progress
                                             .parent_best_height
-                                            .map_or(true, |height| {
-                                                header.height() > height as usize
-                                            })
+                                            .is_none_or(|height| header.height() > height as usize)
                                     {
                                         runtime.progress.parent_best_height =
                                             Some(header.height() as u32);
@@ -2085,7 +2083,7 @@ impl PagedChainSnapshot<'_> {
         };
         if canonical
             .as_ref()
-            .map_or(false, |block| block.height != edge.spending_height as usize)
+            .is_some_and(|block| block.height != edge.spending_height as usize)
         {
             return Err(PageError::Contract);
         }
@@ -2722,10 +2720,7 @@ impl ChainQuery {
                 }
                 None => None,
             };
-        if cache
-            .as_ref()
-            .map_or(false, |(utxos, _)| utxos.len() > limit)
-        {
+        if cache.as_ref().is_some_and(|(utxos, _)| utxos.len() > limit) {
             bail!(ErrorKind::TooManyUtxos(limit));
         }
         let had_cache = cache.is_some();
@@ -3010,9 +3005,9 @@ impl ChainQuery {
         #[cfg(feature = "liquid")]
         {
             let _ = budget;
-            return Ok(self
+            Ok(self
                 .tx_confirming_block(&history.get_txid())
-                .filter(|block| block.height == history.key.confirmed_height as usize));
+                .filter(|block| block.height == history.key.confirmed_height as usize))
         }
         #[cfg(not(feature = "liquid"))]
         {
@@ -3504,7 +3499,7 @@ impl ChainQuery {
             if let Some(block) = self.blockid_by_hash(&hash) {
                 if latest
                     .as_ref()
-                    .map_or(true, |previous| block.height > previous.height)
+                    .is_none_or(|previous| block.height > previous.height)
                 {
                     latest = Some(block);
                 }
@@ -3785,10 +3780,12 @@ fn index_blocks(
                 let height = b.entry.height() as u32;
                 index_transaction(
                     tx,
-                    height,
-                    u16::try_from(idx)
-                        .map_err(|_| Error::from("block transaction position overflow"))?,
-                    block_hash,
+                    BlockPosition {
+                        height,
+                        position: u16::try_from(idx)
+                            .map_err(|_| Error::from("block transaction position overflow"))?,
+                        hash: block_hash,
+                    },
                     previous_txos_map,
                     &mut rows,
                     iconfig,
@@ -3802,17 +3799,26 @@ fn index_blocks(
         .map(|batches| batches.into_iter().flatten().collect())
 }
 
+struct BlockPosition {
+    height: u32,
+    position: u16,
+    hash: FullHash,
+}
+
 // TODO: return an iterator?
 fn index_transaction(
     tx: &Transaction,
-    confirmed_height: u32,
-    tx_position: u16,
-    _block_hash: FullHash,
+    block: BlockPosition,
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
     _op: &Operation,
 ) {
+    let BlockPosition {
+        height: confirmed_height,
+        position: tx_position,
+        hash: _block_hash,
+    } = block;
     // persist history index:
     //      H{funding-scripthash}{spending-height}{spending-block-pos}S{spending-txid:vin}{funding-txid:vout} → ""
     //      H{funding-scripthash}{funding-height}{funding-block-pos}F{funding-txid:vout} → ""
@@ -4337,6 +4343,7 @@ impl TxEdgeRow {
         TxEdgeRow { key }
     }
 
+    #[cfg(feature = "liquid")]
     fn filter(outpoint: &OutPoint) -> Bytes {
         // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
         bincode_util::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout))
@@ -4350,6 +4357,7 @@ impl TxEdgeRow {
         }
     }
 
+    #[cfg(feature = "liquid")]
     fn from_row(row: DBRow) -> Self {
         TxEdgeRow {
             key: bincode_util::deserialize_little(&row.key)
@@ -4358,18 +4366,24 @@ impl TxEdgeRow {
     }
 }
 
+#[cfg(feature = "liquid")]
 #[derive(Serialize, Deserialize)]
 struct ScriptCacheKey {
     code: u8,
     scripthash: FullHash,
 }
 
+#[cfg(any(feature = "liquid", test))]
 struct StatsCacheRow {
+    #[cfg(feature = "liquid")]
     key: ScriptCacheKey,
+    #[cfg(feature = "liquid")]
     value: Bytes,
 }
 
+#[cfg(any(feature = "liquid", test))]
 impl StatsCacheRow {
+    #[cfg(feature = "liquid")]
     fn new(scripthash: &[u8], stats: &ScriptStats, blockhash: &BlockHash) -> Self {
         StatsCacheRow {
             key: ScriptCacheKey {
@@ -4384,6 +4398,7 @@ impl StatsCacheRow {
         [b"A", scripthash].concat()
     }
 
+    #[cfg(feature = "liquid")]
     fn into_row(self) -> DBRow {
         DBRow {
             key: bincode_util::serialize_little(&self.key).unwrap(),
@@ -4394,12 +4409,17 @@ impl StatsCacheRow {
 
 type CachedUtxoMap = HashMap<(Txid, u32), (u32, Value)>; // (txid,vout) => (block_height,output_value)
 
+#[cfg(any(feature = "liquid", test))]
 struct UtxoCacheRow {
+    #[cfg(feature = "liquid")]
     key: ScriptCacheKey,
+    #[cfg(feature = "liquid")]
     value: Bytes,
 }
 
+#[cfg(any(feature = "liquid", test))]
 impl UtxoCacheRow {
+    #[cfg(feature = "liquid")]
     fn new(scripthash: &[u8], utxos: &UtxoMap, blockhash: &BlockHash) -> Self {
         let utxos_cache = make_utxo_cache(utxos);
 
@@ -4416,6 +4436,7 @@ impl UtxoCacheRow {
         [b"U", scripthash].concat()
     }
 
+    #[cfg(feature = "liquid")]
     fn into_row(self) -> DBRow {
         DBRow {
             key: bincode_util::serialize_little(&self.key).unwrap(),
@@ -4697,9 +4718,11 @@ mod supplemental_edge_writer_tests {
         let mut orphan = vec![];
         index_transaction(
             &tx,
-            10,
-            2,
-            [7; 32],
+            BlockPosition {
+                height: 10,
+                position: 2,
+                hash: [7; 32],
+            },
             &prevouts,
             &mut ancestor,
             &config,
@@ -4707,9 +4730,11 @@ mod supplemental_edge_writer_tests {
         );
         index_transaction(
             &tx,
-            20,
-            3,
-            [8; 32],
+            BlockPosition {
+                height: 20,
+                position: 3,
+                hash: [8; 32],
+            },
             &prevouts,
             &mut orphan,
             &config,
